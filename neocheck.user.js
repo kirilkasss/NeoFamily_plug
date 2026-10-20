@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.61
+// @version      1.62
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
 // @match        https://neofamily.ru/*
 // @match        https://*.neofamily.ru/*
@@ -12,6 +12,7 @@
 // @grant        unsafeWindow
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -4149,7 +4150,128 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     }
   }
 
+  // ======================================================================
+  // NeoCheck → Telegram: private daily aggregates (NO student names/messages)
+  // ======================================================================
+  const NC_BRIDGE_KEY = 'nf_telegram_bridge_v1';
+  let ncBusy = false;
+  let ncLastSignature = '';
+  let ncLastPushAt = 0;
+  const ncConfig = () => jsonLoad(NC_BRIDGE_KEY, {});
+  const ncSave = data => jsonSave(NC_BRIDGE_KEY, data);
+  function ncReq(path, body, bearer, done) {
+    const cfg = ncConfig();
+    if (!cfg.url || !/^https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/.*)?$/i.test(cfg.url)) {
+      done(new Error('Нужен HTTPS адрес сервера')); return;
+    }
+    GM_xmlhttpRequest({
+      method: 'POST', url: cfg.url.replace(/\/$/, '') + path,
+      headers: Object.assign({ 'Content-Type': 'application/json' }, bearer ? { Authorization: 'Bearer ' + bearer } : {}),
+      data: JSON.stringify(body), timeout: 15000,
+      onload: r => {
+        try {
+          if (r.status < 200 || r.status >= 300) throw new Error('Сервер: HTTP ' + r.status);
+          done(null, JSON.parse(r.responseText));
+        } catch (e) { done(e); }
+      },
+      ontimeout: () => done(new Error('Истекло время запроса')),
+      onerror: () => done(new Error('Ошибка соединения'))
+    });
+  }
+  function ncSnapshot() {
+    const st = loadStats();
+    const grouped = {};
+    st.records.forEach(r => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date)) return;
+      if (!grouped[r.date]) grouped[r.date] = { date: r.date, regular: 0, neuro: 0, msgs: 0, chatMsgs: 0, estimate: 0 };
+      const p = grouped[r.date];
+      p.regular += Number(r.regular) || 0;
+      p.neuro += Number(r.neuro) || 0;
+      p.msgs += Number(r.msgs) || 0;
+      p.chatMsgs += Number(r.chatMsgs) || 0;
+      p.estimate += recMoney(r, st);
+    });
+    return { days: Object.values(grouped).sort((a, b) => a.date.localeCompare(b.date)).slice(-730)
+      .map(x => ({ ...x, estimate: Math.round(x.estimate * 100) / 100 })) };
+  }
+  function ncSync(force) {
+    const cfg = ncConfig();
+    if (!cfg.token || ncBusy || (!force && Date.now() - ncLastPushAt < 40000)) return;
+    const body = ncSnapshot(), sig = JSON.stringify(body);
+    if (!force && sig === ncLastSignature) return;
+    ncBusy = true;
+    ncLastPushAt = Date.now();
+    ncReq('/v1/snapshot', body, cfg.token, err => {
+      ncBusy = false;
+      if (err) { console.warn('[NeoCheck Telegram] Sync failed', err.message); return; }
+      ncLastSignature = sig;
+      ncUpdateLabel();
+    });
+  }
+  function ncUpdateLabel() {
+    const cfg = ncConfig();
+    const btn = document.getElementById('nf-telegram-connect');
+    if (btn) btn.textContent = cfg.token ? '✅ Telegram' : cfg.code ? '🔗 Подтвердить Telegram' : '🔗 Telegram';
+  }
+  function ncCheckLink() {
+    const cfg = ncConfig();
+    if (!cfg.code || !cfg.secret) return toast('Нет ожидающей привязки', true);
+    ncReq('/v1/pair/status', { code: cfg.code, secret: cfg.secret }, null, (err, response) => {
+      if (err) return toast('Привязка не найдена или истекла: ' + err.message, true);
+      if (!response.linked) return toast('Сначала нажми START в боте, потом повтори проверку', true);
+      ncSave({ url: cfg.url, bot: cfg.bot, token: response.token });
+      ncUpdateLabel(); ncSync(true); toast('✅ Telegram подключён');
+    });
+  }
+  function ncSetup() {
+    const cfg = ncConfig();
+    if (cfg.token) {
+      const action = prompt('Telegram подключён. Напиши «синхронизировать» или «отвязать».', 'синхронизировать');
+      if (!action) return;
+      if (action.toLowerCase().includes('отвяз')) {
+        if (!confirm('Отключить этот браузер от Telegram?')) return;
+        ncReq('/v1/unlink', {}, cfg.token, (err) => {
+          if (err) return toast(err.message, true);
+          ncSave({ url: cfg.url, bot: cfg.bot }); ncLastSignature = ''; ncUpdateLabel(); toast('Telegram отключён');
+        });
+      } else { ncSync(true); toast('Отправляем свежую статистику'); }
+      return;
+    }
+    if (cfg.code) {
+      const action = prompt('Привязка ожидает подтверждения. Напиши «проверить» или «заново».', 'проверить');
+      if (!action) return;
+      if (!action.toLowerCase().includes('занов')) { ncCheckLink(); return; }
+    }
+    const url = prompt('HTTPS адрес сервера NeoCheck, который предоставит школа:', cfg.url || 'https://stats.example.org');
+    if (!url) return;
+    const bot = prompt('Username школьного Telegram-бота БЕЗ @:', cfg.bot || '');
+    if (!bot || !/^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(bot.replace(/^@/, ''))) return toast('Неверное имя бота', true);
+    const normalized = url.trim().replace(/\/+$/, '');
+    if (!/^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(normalized)) return toast('Требуется HTTPS адрес', true);
+    const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
+    ncSave({ url: normalized, bot: bot.replace(/^@/, ''), secret });
+    ncReq('/v1/pair/start', { secret }, null, (err, data) => {
+      if (err) return toast(err.message, true);
+      ncSave({ url: normalized, bot: bot.replace(/^@/, ''), secret, code: data.code });
+      const link = 'https://t.me/' + bot.replace(/^@/, '') + '?start=nc_' + data.code;
+      ncUpdateLabel();
+      window.open(link, '_blank', 'noopener,noreferrer');
+      prompt('Открой ссылку, нажми START у бота, затем кнопку «🔗 Подтвердить Telegram» на сайте. Ссылка:', link);
+    });
+  }
+  function ncEnsureButton() {
+    if (document.getElementById('nf-telegram-connect')) return;
+    const b = document.createElement('button');
+    b.id = 'nf-telegram-connect'; b.type = 'button';
+    b.title = 'Связать статистику NeoCheck с Telegram. Передаём только суммы по дням.';
+    b.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:9995;border:1px solid #7b68ee;border-radius:12px;padding:10px 13px;background:#fff;color:#4031a8;font:700 13px Arial,sans-serif;box-shadow:0 2px 10px #0002;cursor:pointer;';
+    b.addEventListener('click', ncSetup);
+    document.body.appendChild(b); ncUpdateLabel();
+  }
+  setInterval(() => ncSync(false), 45000);
+
   function inject() {
+    ncEnsureButton();
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
     injectPanels();
     syncAttach();
