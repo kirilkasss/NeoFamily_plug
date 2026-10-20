@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.65
+// @version      1.67
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
 // @grant        unsafeWindow
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
@@ -4159,16 +4160,33 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   const NC_BOT_URL = 'https://t.me/MetodistNotifications_bot';
   const NC_SYNC_INTERVAL_MS = 3 * 60 * 60 * 1000; // once every 3 hours while page is open
   let ncBusy = false;
+  let ncLinkSession = null;
+  let ncLastSync = 0;
   function ncCfg() { return jsonLoad(NC_CFG_KEY, {url:NC_SCHOOL_URL,key:'',enabled:false}); }
-  function ncHttp(url, payload) {
-    return new Promise((resolve, reject) => GM_xmlhttpRequest({
-      method:'POST', url, headers:{'Content-Type':'text/plain;charset=utf-8'},
-      data:JSON.stringify(payload), timeout:20000,
-      onload:r => {
-        try { const j=JSON.parse(r.responseText); if(j.ok) resolve(j); else reject(new Error(j.error||'API_ERROR')); }
-        catch(e){reject(new Error('Не удалось прочитать ответ сервера: '+e.message));}
-      }, onerror:()=>reject(new Error('Сетевая ошибка')), ontimeout:()=>reject(new Error('Таймаут'))
-    }));
+  function ncHttp(url, payload, retries=2) {
+    return new Promise((resolve, reject) => {
+      const attempt = (left) => GM_xmlhttpRequest({
+        method:'POST', url, headers:{'Content-Type':'text/plain;charset=utf-8'},
+        data:JSON.stringify(payload), timeout:25000,
+        onload:r => {
+          let j;
+          try { j=JSON.parse(r.responseText); }
+          catch(e) {
+            // Google occasionally returns HTML instead of the expected JSON.
+            if(left>0) { setTimeout(()=>attempt(left-1), 2500); return; }
+            reject(new Error('Google вернул не JSON. Попробуйте позже.')); return;
+          }
+          if(!j || typeof j.ok !== 'boolean') {
+            reject(new Error('Некорректный ответ сервера')); return;
+          }
+          if(j.ok) resolve(j);
+          else { const err=new Error(j.error||'API_ERROR'); err.code=j.error; reject(err); }
+        },
+        onerror:()=>reject(new Error('Сетевая ошибка')),
+        ontimeout:()=>reject(new Error('Таймаут'))
+      });
+      attempt(retries);
+    });
   }
   function ncDaily() {
     const s=loadStats(); const m=new Map();
@@ -4179,12 +4197,9 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       x.msgs+=Number(r.msgs)||0; x.chatMsgs+=Number(r.chatMsgs)||0;
       x.money+=recMoney(r,s); m.set(r.date,x);
     });
-    // Send only the last 45 calendar days (including today), not 45 arbitrary entries.
     const now = new Date();
     const dateISO = d => [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-');
-    const end = dateISO(now);
-    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate()-44);
-    const start = dateISO(cutoff);
+    const end=dateISO(now), start=dateISO(new Date(now.getFullYear(),now.getMonth(),now.getDate()-44));
     return [...m.values()].filter(x=>x.date>=start && x.date<=end)
       .sort((a,b)=>a.date.localeCompare(b.date))
       .map(x=>({...x,money:Math.round(x.money*100)/100}));
@@ -4193,31 +4208,271 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const cfg=ncCfg();
     if(!cfg.enabled || !cfg.key || ncBusy) return;
     ncBusy=true;
-    try { await ncHttp(NC_SCHOOL_URL,{action:'neocheck_sync_v1',key:cfg.key,days:ncDaily()});
+    try {
+      await ncHttp(NC_SCHOOL_URL,{action:'neocheck_sync_v1',key:cfg.key,days:ncDaily()});
+      ncLastSync=Date.now();
       if(manual) toast('✅ NeoCheck: статистика отправлена');
-    } catch(e) { console.warn('[NeoCheck Telegram]',e.message); if(manual) toast('Telegram: '+e.message,true); }
-    finally {ncBusy=false;}
+    } catch(e) {
+      console.warn('[NeoCheck Telegram]',e.message);
+      if(e.code==='UNAUTHORIZED') {
+        jsonSave(NC_CFG_KEY,{...cfg,enabled:false,key:''});
+        toast('Ключ больше не действует, привяжите Telegram заново',true);
+      } else if(manual) toast('Telegram: '+e.message,true);
+    } finally {ncBusy=false;}
+  }
+  function ncOpenBot(url) {
+    if(typeof GM_openInTab==='function') GM_openInTab(url,{active:true,insert:true});
+    else window.open(url,'_blank','noopener,noreferrer');
+  }
+  function ncModal() {
+    document.getElementById('nf-nc-link-modal')?.remove();
+    const cover=el('div','position:fixed;inset:0;z-index:2147483646;background:#1d163a99;display:flex;align-items:center;justify-content:center;padding:16px;');
+    cover.id='nf-nc-link-modal';
+    const box=el('div','width:min(440px,100%);box-sizing:border-box;background:white;color:#28213b;border-radius:18px;padding:22px;box-shadow:0 14px 50px #0004;font:14px/1.5 sans-serif;');
+    const title=el('div','font:bold 19px sans-serif;margin-bottom:10px;', {textContent:'🔗 Подключение Telegram'});
+    const message=el('div','white-space:pre-line;margin-bottom:14px;',{textContent:'Подключи школьный бот, чтобы видеть свою статистику и предварительный заработок.'});
+    const actions=el('div','display:flex;gap:8px;flex-wrap:wrap;');
+    const primary=el('button',CHIP,{type:'button',textContent:'Привязать Telegram'});
+    const manual=el('button',MINI,{type:'button',textContent:'Ввести ключ вручную'});
+    const sync=el('button',MINI,{type:'button',textContent:'Отправить сейчас'});
+    const disconnect=el('button',MINI,{type:'button',textContent:'Отключить'});
+    const close=el('button',MINI,{type:'button',textContent:'Закрыть'});
+    const endSession=()=>{ if(ncLinkSession){ncLinkSession.cancelled=true;ncLinkSession=null;} };
+    const stop=()=>{endSession();cover.remove();};
+    close.onclick=stop;
+    cover.addEventListener('mousedown',e=>{if(e.target===cover)stop();});
+    const cfg=ncCfg();
+    if(cfg.enabled && cfg.key) {
+      message.textContent='🟢 Telegram подключён. Статистика отправляется при подключении и раз в 3 часа, пока открыт NeoFamily.';
+      primary.textContent='Привязать заново';
+    }
+    const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    primary.onclick=async()=>{
+      endSession();
+      const session={cancelled:false}; ncLinkSession=session;
+      primary.disabled=true; manual.disabled=true;
+      message.textContent='Создаём одноразовое подключение…';
+      try {
+        const start=await ncHttp(NC_SCHOOL_URL,{action:'neocheck_link_start_v1'});
+        if(session.cancelled)return;
+        if(!/^[0-9a-f]{32}$/i.test(String(start.code||'')) || !/^https:\/\/t\.me\/MetodistNotifications_bot\?start=nc_[0-9a-f]{32}$/i.test(String(start.url||'')))
+          throw new Error('Сервер прислал неверные данные привязки');
+        const seconds=Math.min(600,Math.max(1,Number(start.expires_in)||600));
+        const endAt=Date.now()+seconds*1000;
+        message.textContent='Открой бота и подтверди привязку.\n\nПроверочный код: '+String(start.check||'—')+'\n\nБот обрабатывает команды примерно раз в минуту. Ожидаем подтверждения (до 10 минут)…';
+        ncOpenBot(start.url);
+        while(!session.cancelled && Date.now()<endAt) {
+          await sleep(4000);
+          if(session.cancelled) return;
+          let result;
+          try { result=await ncHttp(NC_SCHOOL_URL,{action:'neocheck_link_poll_v1',code:start.code},1); }
+          catch(e) {
+            if(['DECLINED','EXPIRED','BAD_REQUEST','BUSY','BOT_NOT_READY'].includes(e.code)) throw e;
+            // Temporary Google errors should not terminate the link flow.
+            console.warn('[NeoCheck link]',e.message);
+            continue;
+          }
+          if(session.cancelled)return;
+          if(result.status==='pending')continue;
+          if(result.status==='ready') {
+            if(typeof result.key!=='string' || result.key.length!==128) throw new Error('Сервер прислал некорректный ключ');
+            jsonSave(NC_CFG_KEY,{url:NC_SCHOOL_URL,key:result.key,enabled:true});
+            message.textContent='✅ Telegram подключён! Отправляем статистику…';
+            toast('Telegram успешно привязан');
+            ncSync(true);
+            return;
+          }
+          throw new Error('Неизвестный статус привязки');
+        }
+        if(!session.cancelled)throw new Error('Время привязки истекло. Начните заново.');
+      } catch(e) {
+        if(!session.cancelled) {
+          const errors={DECLINED:'Привязка отменена в Telegram.',EXPIRED:'Срок действия кода истёк. Начните заново.',BUSY:'Слишком много попыток привязки. Повторите позже.',BOT_NOT_READY:'Бот пока не готов. Попробуйте позже.',BAD_REQUEST:'Некорректный запрос. Попробуйте заново.',SERVER_ERROR:'Ошибка сервера. Попробуйте позже.'};
+          message.textContent='❌ '+(errors[e.code]||e.message);
+        }
+      } finally {
+        if(ncLinkSession===session) ncLinkSession=null;
+        if(cover.isConnected){primary.disabled=false;manual.disabled=false;}
+      }
+    };
+    manual.onclick=()=>{
+      endSession();
+      const key=prompt('Личный ключ из /nc_token. Никому его не передавайте:');
+      if(key===null)return;
+      if(key.trim().length!==128){toast('Неверная длина ключа',true);return;}
+      if(!confirm('Включить отправку личной статистики в школьного бота?'))return;
+      jsonSave(NC_CFG_KEY,{url:NC_SCHOOL_URL,key:key.trim(),enabled:true});
+      message.textContent='🟢 Telegram подключён через личный ключ.';
+      ncSync(true);
+    };
+    sync.onclick=()=>{if(!ncCfg().enabled){toast('Сначала привяжите Telegram',true);return;} ncSync(true);};
+    disconnect.onclick=()=>{
+      if(!confirm('Отключить отправку статистики? Данные, уже отправленные школе, останутся на сервере.'))return;
+      endSession();jsonSave(NC_CFG_KEY,{url:NC_SCHOOL_URL,key:'',enabled:false});
+      message.textContent='Telegram отключён. Для нового подключения нажмите «Привязать Telegram».';
+    };
+    actions.append(primary,manual,sync,disconnect,close);
+    box.append(title,message,actions); cover.append(box); document.body.append(cover);
   }
   function nfTgInject() {
     if(document.getElementById('nf-nc-telegram')) return;
     const b=el('button','position:fixed;right:12px;bottom:12px;z-index:10000;padding:8px 12px;border:1px solid #6b5cff;border-radius:12px;background:#fff;color:#4a3fd6;font:bold 12px sans-serif;cursor:pointer;',
       {id:'nf-nc-telegram',type:'button',textContent:'🔗 Telegram'});
-    b.onclick=()=>{
-      const old=ncCfg();
-      if(!old.key && confirm('Открыть школьного Telegram-бота для команды /nc_token?')) {
-        window.open(NC_BOT_URL, '_blank', 'noopener,noreferrer');
-      }
-      const key=prompt('Личный ключ из /nc_token в @MetodistNotifications_bot. Не отправляйте его другим людям:',old.key||'');
-      if(key===null)return;
-      if(key.trim().length<80){toast('Неверный ключ',true);return;}
-      const enabled=confirm('Включить передачу личной статистики школе? Синхронизация при подключении и затем раз в 3 часа, пока открыт NeoFamily. Отмена — отключить передачу.');
-      jsonSave(NC_CFG_KEY,{url:NC_SCHOOL_URL,key:key.trim(),enabled});
-      toast(enabled?'Передача включена':'Передача отключена');
-      if(enabled)ncSync(true);
-    };
+    b.onclick=ncModal;
     document.body.appendChild(b);
   }
   setInterval(()=>ncSync(false),NC_SYNC_INTERVAL_MS);
+
+  // ======================================================================
+  //  ЧАСТЬ 12. Кто в каком чате: «🔒 Имя» на карточках списка чатов.
+  //  Сайт не сообщает, кем занят чат. Поэтому, пока методист держит чат
+  //  (сайт успешно продлевает резерв: POST /v2/chats/{id}/reservations),
+  //  NeoCheck раз в 45 с отмечается на сервере бота смен, а в списке
+  //  чатов спрашивает, кто где сидит. Нужна Telegram-привязка (ключ в ncCfg).
+  //  Текст переписки не читается и никуда не отправляется — только id чата.
+  // ======================================================================
+  const NC_HOLD_EVERY_MS = 45 * 1000;
+  const NC_WHO_EVERY_MS = 20 * 1000;
+  const NC_CHAT_ID_RE = /\/chat\/([0-9a-z]{26})(?:[/?#]|$)/;
+  const NC_RESERVE_RE = /\/v2\/chats\/([0-9a-z]{26})\/reservations(?:[?#]|$)/;
+  let ncHeld = null, ncHeldSent = 0;
+  let ncWho = {}, ncWhoAt = 0, ncWhoIds = '', ncWhoBusy = false;
+  let ncDeniedShown = '';
+
+  function ncChatKey() { return ncCfg().key || ''; }
+  function ncPageChatId() { const m = location.pathname.match(NC_CHAT_ID_RE); return m ? m[1] : null; }
+
+  function ncHoldPing(force) {
+    const key = ncChatKey();
+    if (!key || !ncHeld || (!force && Date.now() - ncHeldSent < NC_HOLD_EVERY_MS)) return;
+    ncHeldSent = Date.now();
+    ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_here_v1', key, chatId:ncHeld})
+      .catch(e => console.warn('[NeoCheck чаты]', e.message));
+  }
+
+  function ncHoldLeave() {
+    const key = ncChatKey(), chatId = ncHeld;
+    ncHeld = null; ncHeldSent = 0;
+    if (key && chatId) ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_leave_v1', key, chatId}).catch(() => {});
+  }
+
+  function ncAgo(since, now) {
+    const min = Math.max(0, Math.round((now - since) / 60000));
+    return min < 1 ? 'только что' : min < 60 ? min + ' мин' : Math.floor(min / 60) + ' ч ' + (min % 60) + ' мин';
+  }
+
+  // Сайт отказал в резерве — подсказываем, у кого чат (если тот методист с NeoCheck).
+  async function ncShowHolder(chatId) {
+    const key = ncChatKey();
+    if (!key || ncDeniedShown === chatId) return;
+    ncDeniedShown = chatId;
+    try {
+      const r = await ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_who_v1', key, chatIds:[chatId]});
+      const b = r.busy && r.busy[chatId];
+      if (b && !b.me) toast('🔒 Чат сейчас у: ' + b.name + ' (' + ncAgo(b.since, r.now) + ')', true);
+    } catch (_) { /* не страшно */ }
+  }
+
+  function ncOnReserve(url, status) {
+    const chatId = (String(url).match(NC_RESERVE_RE) || [])[1];
+    if (!chatId) return;
+    if (status >= 200 && status < 300) {
+      const isNew = ncHeld !== chatId;
+      if (isNew && ncHeld) ncHoldLeave();
+      ncHeld = chatId;
+      ncDeniedShown = '';
+      ncHoldPing(isNew);
+    } else if (status >= 400) {
+      if (ncHeld === chatId) { ncHeld = null; ncHeldSent = 0; }
+      ncShowHolder(chatId);
+    }
+  }
+
+  (function installReserveObserver() {
+    const w = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    if (w.__nfReserveHook) return;
+    w.__nfReserveHook = true;
+    const origFetch = w.fetch;
+    if (typeof origFetch === 'function') {
+      w.fetch = function (input, init) {
+        const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const url = typeof input === 'string' ? input : (input && input.url);
+        const p = origFetch.apply(this, arguments);
+        if (url && method === 'POST' && NC_RESERVE_RE.test(url)) {
+          p.then(r => ncOnReserve(url, r.status)).catch(() => {});
+        }
+        return p;
+      };
+    }
+    const P = w.XMLHttpRequest && w.XMLHttpRequest.prototype;
+    if (P) {
+      const open = P.open, send = P.send;
+      P.open = function (m, u) { this.__nfRes = {m:String(m).toUpperCase(), u:String(u)}; return open.apply(this, arguments); };
+      P.send = function () {
+        const r = this.__nfRes;
+        if (r && r.m === 'POST' && NC_RESERVE_RE.test(r.u)) {
+          this.addEventListener('loadend', () => { try { ncOnReserve(r.u, this.status); } catch (_) {} }, {once:true});
+        }
+        return send.apply(this, arguments);
+      };
+    }
+  })();
+
+  async function ncWhoRefresh(ids) {
+    const key = ncChatKey();
+    if (!key || ncWhoBusy) return;
+    ncWhoBusy = true;
+    try {
+      const r = await ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_who_v1', key, chatIds:ids});
+      ncWho = r.busy || {};
+      ncWho.__now = r.now;
+      ncWhoAt = Date.now();
+      ncWhoIds = ids.join(',');
+      nfChatLocksRender();
+    } catch (e) {
+      console.warn('[NeoCheck чаты]', e.message);
+      ncWhoAt = Date.now(); // не долбим сервер при ошибке
+    } finally { ncWhoBusy = false; }
+  }
+
+  function ncChatCards() {
+    return [...document.querySelectorAll('a[href*="/chat/"]')]
+      .map(a => ({a, id:(a.getAttribute('href').match(NC_CHAT_ID_RE) || [])[1]}))
+      .filter(x => x.id);
+  }
+
+  function nfChatLocksRender() {
+    const now = ncWho.__now || Date.now();
+    for (const {a, id} of ncChatCards()) {
+      const b = ncWho[id];
+      let badge = a.querySelector(':scope > .nf-chat-lock');
+      const text = !b ? '' : b.me ? '✓ Этот чат у вас' : '🔒 Сейчас в чате: ' + b.name + ' · ' + ncAgo(b.since, now);
+      if (!text) { if (badge) badge.remove(); continue; }
+      if (!badge) {
+        badge = document.createElement('div');
+        badge.className = 'nf-chat-lock';
+        a.insertBefore(badge, a.firstChild);
+      }
+      const css = 'align-self:flex-start;padding:4px 10px;border-radius:10px;font:700 12px/1.4 Nunito,system-ui,sans-serif;' +
+        (b.me ? 'background:#e4f5e8;color:#276e43;' : 'background:#fde8ec;color:#b83f53;');
+      if (badge.textContent !== text) badge.textContent = text;
+      if (badge.style.cssText !== css) badge.style.cssText = css;
+    }
+  }
+
+  function nfChatLocksInject() {
+    // Ушли со страницы удерживаемого чата — сразу снимаем отметку.
+    if (ncHeld && ncPageChatId() !== ncHeld) ncHoldLeave();
+    if (ncDeniedShown && ncPageChatId() !== ncDeniedShown) ncDeniedShown = '';
+    ncHoldPing(false);
+    const ids = ncChatCards().map(x => x.id);
+    if (!ids.length) return;
+    const uniq = [...new Set(ids)].slice(0, 200);
+    if (uniq.join(',') !== ncWhoIds || Date.now() - ncWhoAt > NC_WHO_EVERY_MS) ncWhoRefresh(uniq);
+    else nfChatLocksRender();
+  }
+  setInterval(nfChatLocksInject, 15000);
+  window.addEventListener('pagehide', ncHoldLeave);
 
   function inject() {
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
@@ -4233,6 +4488,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     nfBackupInject();
     nfQuickReplyInject();
     nfFocusInject();
+    nfChatLocksInject();
   }
 
   let timer;
