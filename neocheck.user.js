@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.63
+// @version      1.63-gas-school
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
 // @match        https://neofamily.ru/*
 // @match        https://*.neofamily.ru/*
@@ -4153,8 +4153,11 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   // NeoCheck -> school Google Apps Script (opt-in, private preview only)
   // ======================================================================
   const NC_CFG_KEY = 'nf_nc_gas_cfg_v1';
+  const NC_SCHOOL_URL = 'https://script.google.com/macros/s/AKfycbwrJmBKt19r676ojqRRPAvbFrh9q22CeC2MKN7Rxcx1zTyDsgtipUrpZsTNy2_Seqxuxg/exec';
+  const NC_BOT_URL = 'https://t.me/MetodistNotifications_bot';
+  const NC_SYNC_INTERVAL_MS = 3 * 60 * 60 * 1000; // once every 3 hours while page is open
   let ncBusy = false;
-  function ncCfg() { return jsonLoad(NC_CFG_KEY, {url:'',key:'',enabled:false}); }
+  function ncCfg() { return jsonLoad(NC_CFG_KEY, {url:NC_SCHOOL_URL,key:'',enabled:false}); }
   function ncHttp(url, payload) {
     return new Promise((resolve, reject) => GM_xmlhttpRequest({
       method:'POST', url, headers:{'Content-Type':'text/plain;charset=utf-8'},
@@ -4174,13 +4177,21 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       x.msgs+=Number(r.msgs)||0; x.chatMsgs+=Number(r.chatMsgs)||0;
       x.money+=recMoney(r,s); m.set(r.date,x);
     });
-    return [...m.values()].sort((a,b)=>a.date.localeCompare(b.date)).map(x=>({...x,money:Math.round(x.money*100)/100})).slice(-400);
+    // Send only the last 45 calendar days (including today), not 45 arbitrary entries.
+    const now = new Date();
+    const dateISO = d => [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-');
+    const end = dateISO(now);
+    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate()-44);
+    const start = dateISO(cutoff);
+    return [...m.values()].filter(x=>x.date>=start && x.date<=end)
+      .sort((a,b)=>a.date.localeCompare(b.date))
+      .map(x=>({...x,money:Math.round(x.money*100)/100}));
   }
   async function ncSync(manual=false) {
     const cfg=ncCfg();
-    if(!cfg.enabled || !cfg.key || !/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(cfg.url) || ncBusy) return;
+    if(!cfg.enabled || !cfg.key || ncBusy) return;
     ncBusy=true;
-    try { await ncHttp(cfg.url,{action:'neocheck_sync_v1',key:cfg.key,days:ncDaily()});
+    try { await ncHttp(NC_SCHOOL_URL,{action:'neocheck_sync_v1',key:cfg.key,days:ncDaily()});
       if(manual) toast('✅ NeoCheck: статистика отправлена');
     } catch(e) { console.warn('[NeoCheck Telegram]',e.message); if(manual) toast('Telegram: '+e.message,true); }
     finally {ncBusy=false;}
@@ -4191,19 +4202,20 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       {id:'nf-nc-telegram',type:'button',textContent:'🔗 Telegram'});
     b.onclick=()=>{
       const old=ncCfg();
-      const url=prompt('HTTPS URL Google Apps Script (/exec). Отмена — ничего не менять:',old.url||'');
-      if(url===null)return;
-      const key=prompt('Личный ключ из команды /nc_token в школьном боте (никому не пересылайте):',old.key||'');
+      if(!old.key && confirm('Открыть школьного Telegram-бота для команды /nc_token?')) {
+        window.open(NC_BOT_URL, '_blank', 'noopener,noreferrer');
+      }
+      const key=prompt('Личный ключ из /nc_token в @MetodistNotifications_bot. Не отправляйте его другим людям:',old.key||'');
       if(key===null)return;
-      if(!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(url.trim()) || key.trim().length<80){toast('Неверный адрес или ключ',true);return;}
-      const enabled=confirm('Включить передачу личной статистики на сервер школы? Отмена — отключить передачу.');
-      jsonSave(NC_CFG_KEY,{url:url.trim(),key:key.trim(),enabled});
+      if(key.trim().length<80){toast('Неверный ключ',true);return;}
+      const enabled=confirm('Включить передачу личной статистики школе? Синхронизация при подключении и затем раз в 3 часа, пока открыт NeoFamily. Отмена — отключить передачу.');
+      jsonSave(NC_CFG_KEY,{url:NC_SCHOOL_URL,key:key.trim(),enabled});
       toast(enabled?'Передача включена':'Передача отключена');
       if(enabled)ncSync(true);
     };
     document.body.appendChild(b);
   }
-  setInterval(()=>ncSync(false),60000);
+  setInterval(()=>ncSync(false),NC_SYNC_INTERVAL_MS);
 
   function inject() {
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
