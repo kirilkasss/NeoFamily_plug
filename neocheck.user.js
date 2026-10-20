@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.62
+// @version      1.62-gas
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
 // @match        https://neofamily.ru/*
 // @match        https://*.neofamily.ru/*
@@ -12,7 +12,6 @@
 // @grant        unsafeWindow
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
-// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -4151,133 +4150,69 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   }
 
   // ======================================================================
-  // NeoCheck → Telegram: private daily aggregates (NO student names/messages)
+  // NeoCheck -> school Google Apps Script (opt-in, private preview only)
   // ======================================================================
-  const NC_BRIDGE_KEY = 'nf_telegram_bridge_v1';
+  const NC_CFG_KEY = 'nf_nc_gas_cfg_v1';
   let ncBusy = false;
-  let ncLastSignature = '';
-  let ncLastPushAt = 0;
-  const ncConfig = () => jsonLoad(NC_BRIDGE_KEY, {});
-  const ncSave = data => jsonSave(NC_BRIDGE_KEY, data);
-  function ncReq(path, body, bearer, done) {
-    const cfg = ncConfig();
-    if (!cfg.url || !/^https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/.*)?$/i.test(cfg.url)) {
-      done(new Error('Нужен HTTPS адрес сервера')); return;
-    }
-    GM_xmlhttpRequest({
-      method: 'POST', url: cfg.url.replace(/\/$/, '') + path,
-      headers: Object.assign({ 'Content-Type': 'application/json' }, bearer ? { Authorization: 'Bearer ' + bearer } : {}),
-      data: JSON.stringify(body), timeout: 15000,
-      onload: r => {
-        try {
-          if (r.status < 200 || r.status >= 300) throw new Error('Сервер: HTTP ' + r.status);
-          done(null, JSON.parse(r.responseText));
-        } catch (e) { done(e); }
-      },
-      ontimeout: () => done(new Error('Истекло время запроса')),
-      onerror: () => done(new Error('Ошибка соединения'))
+  function ncCfg() { return jsonLoad(NC_CFG_KEY, {url:'',key:'',enabled:false}); }
+  function ncHttp(url, payload) {
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+      method:'POST', url, headers:{'Content-Type':'text/plain;charset=utf-8'},
+      data:JSON.stringify(payload), timeout:20000,
+      onload:r => {
+        try { const j=JSON.parse(r.responseText); if(j.ok) resolve(j); else reject(new Error(j.error||'API_ERROR')); }
+        catch(e){reject(new Error('Не удалось прочитать ответ сервера: '+e.message));}
+      }, onerror:()=>reject(new Error('Сетевая ошибка')), ontimeout:()=>reject(new Error('Таймаут'))
+    }));
+  }
+  function ncDaily() {
+    const s=loadStats(); const m=new Map();
+    s.records.forEach(r=>{
+      if(!/^20\d\d-\d\d-\d\d$/.test(String(r.date))) return;
+      const x=m.get(r.date)||{date:r.date,regular:0,neuro:0,msgs:0,chatMsgs:0,money:0};
+      x.regular+=Number(r.regular)||0; x.neuro+=Number(r.neuro)||0;
+      x.msgs+=Number(r.msgs)||0; x.chatMsgs+=Number(r.chatMsgs)||0;
+      x.money+=recMoney(r,s); m.set(r.date,x);
     });
+    return [...m.values()].sort((a,b)=>a.date.localeCompare(b.date)).map(x=>({...x,money:Math.round(x.money*100)/100})).slice(-400);
   }
-  function ncSnapshot() {
-    const st = loadStats();
-    const grouped = {};
-    st.records.forEach(r => {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date)) return;
-      if (!grouped[r.date]) grouped[r.date] = { date: r.date, regular: 0, neuro: 0, msgs: 0, chatMsgs: 0, estimate: 0 };
-      const p = grouped[r.date];
-      p.regular += Number(r.regular) || 0;
-      p.neuro += Number(r.neuro) || 0;
-      p.msgs += Number(r.msgs) || 0;
-      p.chatMsgs += Number(r.chatMsgs) || 0;
-      p.estimate += recMoney(r, st);
-    });
-    return { days: Object.values(grouped).sort((a, b) => a.date.localeCompare(b.date)).slice(-730)
-      .map(x => ({ ...x, estimate: Math.round(x.estimate * 100) / 100 })) };
+  async function ncSync(manual=false) {
+    const cfg=ncCfg();
+    if(!cfg.enabled || !cfg.key || !/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(cfg.url) || ncBusy) return;
+    ncBusy=true;
+    try { await ncHttp(cfg.url,{action:'neocheck_sync_v1',key:cfg.key,days:ncDaily()});
+      if(manual) toast('✅ NeoCheck: статистика отправлена');
+    } catch(e) { console.warn('[NeoCheck Telegram]',e.message); if(manual) toast('Telegram: '+e.message,true); }
+    finally {ncBusy=false;}
   }
-  function ncSync(force) {
-    const cfg = ncConfig();
-    if (!cfg.token || ncBusy || (!force && Date.now() - ncLastPushAt < 40000)) return;
-    const body = ncSnapshot(), sig = JSON.stringify(body);
-    if (!force && sig === ncLastSignature) return;
-    ncBusy = true;
-    ncLastPushAt = Date.now();
-    ncReq('/v1/snapshot', body, cfg.token, err => {
-      ncBusy = false;
-      if (err) { console.warn('[NeoCheck Telegram] Sync failed', err.message); return; }
-      ncLastSignature = sig;
-      ncUpdateLabel();
-    });
+  function nfTgInject() {
+    if(document.getElementById('nf-nc-telegram')) return;
+    const b=el('button','position:fixed;right:12px;bottom:12px;z-index:10000;padding:8px 12px;border:1px solid #6b5cff;border-radius:12px;background:#fff;color:#4a3fd6;font:bold 12px sans-serif;cursor:pointer;',
+      {id:'nf-nc-telegram',type:'button',textContent:'🔗 Telegram'});
+    b.onclick=()=>{
+      const old=ncCfg();
+      const url=prompt('HTTPS URL Google Apps Script (/exec). Отмена — ничего не менять:',old.url||'');
+      if(url===null)return;
+      const key=prompt('Личный ключ из команды /nc_token в школьном боте (никому не пересылайте):',old.key||'');
+      if(key===null)return;
+      if(!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(url.trim()) || key.trim().length<80){toast('Неверный адрес или ключ',true);return;}
+      const enabled=confirm('Включить передачу личной статистики на сервер школы? Отмена — отключить передачу.');
+      jsonSave(NC_CFG_KEY,{url:url.trim(),key:key.trim(),enabled});
+      toast(enabled?'Передача включена':'Передача отключена');
+      if(enabled)ncSync(true);
+    };
+    document.body.appendChild(b);
   }
-  function ncUpdateLabel() {
-    const cfg = ncConfig();
-    const btn = document.getElementById('nf-telegram-connect');
-    if (btn) btn.textContent = cfg.token ? '✅ Telegram' : cfg.code ? '🔗 Подтвердить Telegram' : '🔗 Telegram';
-  }
-  function ncCheckLink() {
-    const cfg = ncConfig();
-    if (!cfg.code || !cfg.secret) return toast('Нет ожидающей привязки', true);
-    ncReq('/v1/pair/status', { code: cfg.code, secret: cfg.secret }, null, (err, response) => {
-      if (err) return toast('Привязка не найдена или истекла: ' + err.message, true);
-      if (!response.linked) return toast('Сначала нажми START в боте, потом повтори проверку', true);
-      ncSave({ url: cfg.url, bot: cfg.bot, token: response.token });
-      ncUpdateLabel(); ncSync(true); toast('✅ Telegram подключён');
-    });
-  }
-  function ncSetup() {
-    const cfg = ncConfig();
-    if (cfg.token) {
-      const action = prompt('Telegram подключён. Напиши «синхронизировать» или «отвязать».', 'синхронизировать');
-      if (!action) return;
-      if (action.toLowerCase().includes('отвяз')) {
-        if (!confirm('Отключить этот браузер от Telegram?')) return;
-        ncReq('/v1/unlink', {}, cfg.token, (err) => {
-          if (err) return toast(err.message, true);
-          ncSave({ url: cfg.url, bot: cfg.bot }); ncLastSignature = ''; ncUpdateLabel(); toast('Telegram отключён');
-        });
-      } else { ncSync(true); toast('Отправляем свежую статистику'); }
-      return;
-    }
-    if (cfg.code) {
-      const action = prompt('Привязка ожидает подтверждения. Напиши «проверить» или «заново».', 'проверить');
-      if (!action) return;
-      if (!action.toLowerCase().includes('занов')) { ncCheckLink(); return; }
-    }
-    const url = prompt('HTTPS адрес сервера NeoCheck, который предоставит школа:', cfg.url || 'https://stats.example.org');
-    if (!url) return;
-    const bot = prompt('Username школьного Telegram-бота БЕЗ @:', cfg.bot || '');
-    if (!bot || !/^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(bot.replace(/^@/, ''))) return toast('Неверное имя бота', true);
-    const normalized = url.trim().replace(/\/+$/, '');
-    if (!/^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(normalized)) return toast('Требуется HTTPS адрес', true);
-    const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
-    ncSave({ url: normalized, bot: bot.replace(/^@/, ''), secret });
-    ncReq('/v1/pair/start', { secret }, null, (err, data) => {
-      if (err) return toast(err.message, true);
-      ncSave({ url: normalized, bot: bot.replace(/^@/, ''), secret, code: data.code });
-      const link = 'https://t.me/' + bot.replace(/^@/, '') + '?start=nc_' + data.code;
-      ncUpdateLabel();
-      window.open(link, '_blank', 'noopener,noreferrer');
-      prompt('Открой ссылку, нажми START у бота, затем кнопку «🔗 Подтвердить Telegram» на сайте. Ссылка:', link);
-    });
-  }
-  function ncEnsureButton() {
-    if (document.getElementById('nf-telegram-connect')) return;
-    const b = document.createElement('button');
-    b.id = 'nf-telegram-connect'; b.type = 'button';
-    b.title = 'Связать статистику NeoCheck с Telegram. Передаём только суммы по дням.';
-    b.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:9995;border:1px solid #7b68ee;border-radius:12px;padding:10px 13px;background:#fff;color:#4031a8;font:700 13px Arial,sans-serif;box-shadow:0 2px 10px #0002;cursor:pointer;';
-    b.addEventListener('click', ncSetup);
-    document.body.appendChild(b); ncUpdateLabel();
-  }
-  setInterval(() => ncSync(false), 45000);
+  setInterval(()=>ncSync(false),60000);
 
   function inject() {
-    ncEnsureButton();
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
     injectPanels();
     syncAttach();
     refreshView();
     trackAnswers();
     ensureStatsWidget();
+    nfTgInject();
     scanMessages(); // обновляем счётчик сообщений при каждом изменении DOM
     shiftInject();
     nfRegInject();
