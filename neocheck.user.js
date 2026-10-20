@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.67
+// @version      1.68
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
@@ -4338,6 +4338,9 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   let ncHeld = null, ncHeldSent = 0;
   let ncWho = {}, ncWhoAt = 0, ncWhoIds = '', ncWhoBusy = false;
   let ncDeniedShown = '';
+  let ncWhoError = '';
+  let ncReserveObserved = false;
+  let ncLastConfirmedChat = '';
 
   function ncChatKey() { return ncCfg().key || ''; }
   function ncPageChatId() { const m = location.pathname.match(NC_CHAT_ID_RE); return m ? m[1] : null; }
@@ -4346,8 +4349,9 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const key = ncChatKey();
     if (!key || !ncHeld || (!force && Date.now() - ncHeldSent < NC_HOLD_EVERY_MS)) return;
     ncHeldSent = Date.now();
-    ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_here_v1', key, chatId:ncHeld})
-      .catch(e => console.warn('[NeoCheck чаты]', e.message));
+    const chatId = ncHeld;
+    ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_here_v1', key, chatId})
+      .catch(e => { ncHeldSent = 0; console.warn('[NeoCheck чаты] here:', e.message); });
   }
 
   function ncHoldLeave() {
@@ -4376,14 +4380,17 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   function ncOnReserve(url, status) {
     const chatId = (String(url).match(NC_RESERVE_RE) || [])[1];
     if (!chatId) return;
+    ncReserveObserved = true;
+    console.debug('[NeoCheck чаты] reservation', chatId, status);
     if (status >= 200 && status < 300) {
+      ncLastConfirmedChat = chatId;
       const isNew = ncHeld !== chatId;
       if (isNew && ncHeld) ncHoldLeave();
       ncHeld = chatId;
       ncDeniedShown = '';
       ncHoldPing(isNew);
     } else if (status >= 400) {
-      if (ncHeld === chatId) { ncHeld = null; ncHeldSent = 0; }
+      if (ncHeld === chatId) { ncHoldLeave(); }
       ncShowHolder(chatId);
     }
   }
@@ -4426,19 +4433,50 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       const r = await ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_who_v1', key, chatIds:ids});
       ncWho = r.busy || {};
       ncWho.__now = r.now;
+      ncWhoError = '';
       ncWhoAt = Date.now();
       ncWhoIds = ids.join(',');
       nfChatLocksRender();
     } catch (e) {
-      console.warn('[NeoCheck чаты]', e.message);
+      console.warn('[NeoCheck чаты] who:', e.message);
+      ncWhoError = e.code === 'UNAUTHORIZED' ? 'Ключ Telegram не действует. Привяжите заново.' : e.message;
+      ncWhoIds = ids.join(',');
       ncWhoAt = Date.now(); // не долбим сервер при ошибке
-    } finally { ncWhoBusy = false; }
+    } finally { ncWhoBusy = false; nfChatStatusRender(); }
   }
 
   function ncChatCards() {
     return [...document.querySelectorAll('a[href*="/chat/"]')]
       .map(a => ({a, id:(a.getAttribute('href').match(NC_CHAT_ID_RE) || [])[1]}))
       .filter(x => x.id);
+  }
+
+  // Видимый индикатор диагностики в списке. Если активных резервов нет,
+  // отсутствие плашек — нормальное состояние, а не признак поломки.
+  function nfChatStatusRender() {
+    const cards = ncChatCards();
+    let status = document.getElementById('nf-chat-locks-status');
+    if (!cards.length) { if (status) status.remove(); return; }
+    const parent = cards[0].a.parentElement;
+    if (!parent) return;
+    if (!status || status.parentElement !== parent) {
+      status?.remove();
+      status = document.createElement('div');
+      status.id = 'nf-chat-locks-status';
+      status.style.cssText = 'align-self:flex-start;box-sizing:border-box;padding:7px 11px;border-radius:11px;font:700 12px/1.5 Nunito,system-ui,sans-serif;background:#eef4ff;color:#325078;border:1px solid #d5e2f5;';
+      parent.insertBefore(status, cards[0].a);
+    }
+    const key = ncChatKey();
+    const count = Object.keys(ncWho).filter(k => k !== '__now').length;
+    const message = !key
+      ? '🔗 Статусы чатов: привяжите Telegram в NeoCheck'
+      : ncWhoError
+        ? '⚠️ Статусы чатов: ' + ncWhoError
+        : !ncWhoAt
+          ? '⏳ Проверяем занятость чатов…'
+          : '🔒 Проверка чатов работает · занято: ' + count + (count ? '' : ' (плашки появятся при активной работе)');
+    if (status.textContent !== message) status.textContent = message;
+    status.title = 'Плашки показывают только подтверждённые резервы методистов с NeoCheck и привязанным Telegram. После закрытия чата резерв снимается.';
   }
 
   function nfChatLocksRender() {
@@ -4466,13 +4504,15 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     if (ncDeniedShown && ncPageChatId() !== ncDeniedShown) ncDeniedShown = '';
     ncHoldPing(false);
     const ids = ncChatCards().map(x => x.id);
-    if (!ids.length) return;
+    if (!ids.length) { nfChatStatusRender(); return; }
+    nfChatStatusRender();
     const uniq = [...new Set(ids)].slice(0, 200);
     if (uniq.join(',') !== ncWhoIds || Date.now() - ncWhoAt > NC_WHO_EVERY_MS) ncWhoRefresh(uniq);
     else nfChatLocksRender();
   }
-  setInterval(nfChatLocksInject, 15000);
+  setInterval(nfChatLocksInject, 5000); // Быстрый поиск карточек, HTTP не чаще 20 сек
   window.addEventListener('pagehide', ncHoldLeave);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) nfChatLocksInject(); });
 
   function inject() {
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
