@@ -4315,12 +4315,32 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     box.append(title,message,actions); cover.append(box); document.body.append(cover);
   }
   function nfTgInject() {
-    if(document.getElementById('nf-nc-telegram')) return;
-    const b=el('button','position:fixed;right:12px;bottom:12px;z-index:10000;padding:8px 12px;border:1px solid #6b5cff;border-radius:12px;background:#fff;color:#4a3fd6;font:bold 12px sans-serif;cursor:pointer;',
-      {id:'nf-nc-telegram',type:'button',textContent:'🔗 Telegram'});
-    b.onclick=ncModal;
-    document.body.appendChild(b);
+  // Создаём нижнюю панель NeoCheck, если её ещё нет.
+  const dock = nfThemeDockInject();
+  if (!dock) return;
+
+  // Если кнопка уже существует — просто проверяем её расположение.
+  let b = document.getElementById('nf-nc-telegram');
+
+  if (b) {
+    if (b.parentElement !== dock) {
+      dock.appendChild(b);
+    }
+    return;
   }
+
+  // Telegram находится рядом с «Фокус» и «Тема».
+  b = document.createElement('button');
+  b.id = 'nf-nc-telegram';
+  b.type = 'button';
+  b.className = 'nf-dock-btn';
+  b.textContent = '🔗 Telegram';
+  b.title = 'Подключение Telegram и синхронизация статистики';
+
+  b.addEventListener('click', ncModal);
+
+  dock.appendChild(b);
+}
   setInterval(()=>ncSync(false),NC_SYNC_INTERVAL_MS);
 
   // ======================================================================
