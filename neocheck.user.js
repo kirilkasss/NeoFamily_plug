@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.68
+// @version      1.69
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
@@ -4328,7 +4328,8 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   //  Сайт не сообщает, кем занят чат. Поэтому, пока методист держит чат
   //  (сайт успешно продлевает резерв: POST /v2/chats/{id}/reservations),
   //  NeoCheck раз в 45 с отмечается на сервере бота смен, а в списке
-  //  чатов спрашивает, кто где сидит. Нужна Telegram-привязка (ключ в ncCfg).
+  //  чатов спрашивает, кто где сидит, а над свободными чатами показывает,
+  //  кто заходил последним (до 7 дней). Нужна Telegram-привязка (ключ в ncCfg).
   //  Текст переписки не читается и никуда не отправляется — только id чата.
   // ======================================================================
   const NC_HOLD_EVERY_MS = 45 * 1000;
@@ -4337,6 +4338,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   const NC_RESERVE_RE = /\/v2\/chats\/([0-9a-z]{26})\/reservations(?:[?#]|$)/;
   let ncHeld = null, ncHeldSent = 0;
   let ncWho = {}, ncWhoAt = 0, ncWhoIds = '', ncWhoBusy = false;
+  let ncLast = {};
   let ncDeniedShown = '';
   let ncWhoError = '';
   let ncReserveObserved = false;
@@ -4362,7 +4364,10 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
   function ncAgo(since, now) {
     const min = Math.max(0, Math.round((now - since) / 60000));
-    return min < 1 ? 'только что' : min < 60 ? min + ' мин' : Math.floor(min / 60) + ' ч ' + (min % 60) + ' мин';
+    if (min < 1) return 'только что';
+    if (min < 60) return min + ' мин';
+    if (min < 1440) return Math.floor(min / 60) + ' ч ' + (min % 60) + ' мин';
+    return Math.floor(min / 1440) + ' дн';
   }
 
   // Сайт отказал в резерве — подсказываем, у кого чат (если тот методист с NeoCheck).
@@ -4433,6 +4438,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       const r = await ncHttp(NC_SCHOOL_URL, {action:'neocheck_chat_who_v1', key, chatIds:ids});
       ncWho = r.busy || {};
       ncWho.__now = r.now;
+      ncLast = r.last || {};
       ncWhoError = '';
       ncWhoAt = Date.now();
       ncWhoIds = ids.join(',');
@@ -4482,9 +4488,12 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   function nfChatLocksRender() {
     const now = ncWho.__now || Date.now();
     for (const {a, id} of ncChatCards()) {
-      const b = ncWho[id];
+      const b = ncWho[id], l = !b && ncLast[id];
       let badge = a.querySelector(':scope > .nf-chat-lock');
-      const text = !b ? '' : b.me ? '✓ Этот чат у вас' : '🔒 Сейчас в чате: ' + b.name + ' · ' + ncAgo(b.since, now);
+      const ago = at => { const t = ncAgo(at, now); return t === 'только что' ? t : t + ' назад'; };
+      const text = b ? (b.me ? '✓ Этот чат у вас' : '🔒 Сейчас в чате: ' + b.name + ' · ' + ncAgo(b.since, now))
+        : l ? (l.me ? '🕓 Последними заходили вы · ' : '🕓 Последним заходил(а): ' + l.name + ' · ') + ago(l.at)
+        : '';
       if (!text) { if (badge) badge.remove(); continue; }
       if (!badge) {
         badge = document.createElement('div');
@@ -4492,7 +4501,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         a.insertBefore(badge, a.firstChild);
       }
       const css = 'align-self:flex-start;padding:4px 10px;border-radius:10px;font:700 12px/1.4 Nunito,system-ui,sans-serif;' +
-        (b.me ? 'background:#e4f5e8;color:#276e43;' : 'background:#fde8ec;color:#b83f53;');
+        (!b ? 'background:#f1eff6;color:#60566d;' : b.me ? 'background:#e4f5e8;color:#276e43;' : 'background:#fde8ec;color:#b83f53;');
       if (badge.textContent !== text) badge.textContent = text;
       if (badge.style.cssText !== css) badge.style.cssText = css;
     }
