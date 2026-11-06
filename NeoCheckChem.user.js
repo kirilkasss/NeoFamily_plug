@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheckForChem
 // @namespace    neofamily-copy-for-check
-// @version      2
+// @version      3
 // @updateURL    none
 // @description  1
 // @match        https://neofamily.ru/*
@@ -4205,7 +4205,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   // NeoCheck -> school Google Apps Script (opt-in, private preview only)
   // ======================================================================
   const NC_CFG_KEY = 'nf_nc_gas_cfg_v1';
-  const NC_SCHOOL_URL = 'https://script.google.com/macros/s/AKfycbwrJmBKt19r676ojqRRPAvbFrh9q22CeC2MKN7Rxcx1zTyDsgtipUrpZsTNy2_Seqxuxg/exec';
+  const NC_SCHOOL_URL = 'https://script.google.com/macros/s/AKfycbyqCxRlwOlhgIrFYyVR6bBVWIxhtygGrriT7qDRxc4BlRIAaI74Wh_5wqIS5FKfDOP6/exec';
   const NC_BOT_URL = 'https://t.me/chemetodist_bot';
   const NC_SYNC_INTERVAL_MS = 3 * 60 * 60 * 1000; // once every 3 hours while page is open
   let ncBusy = false;
