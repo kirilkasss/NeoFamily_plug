@@ -28,6 +28,7 @@
 
   // Эта строка добавляется в начало копируемого текста. Можно поменять или оставить пустой ''.
   const PREFIX = 'Проверь по скиллу ege-bio-check.';
+  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.79';
 
   const DETAIL = '[class*="detail-text_detailText"]';
 
@@ -2808,7 +2809,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   function shiftGoogleRequest(name) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') { reject(new Error('GM_xmlhttpRequest недоступен')); return; }
-      const url = SHIFT_GOOGLE_URL + '?key=' + encodeURIComponent(SHIFT_GOOGLE_KEY) + '&name=' + encodeURIComponent(name);
+      const url = SHIFT_GOOGLE_URL + '?key=' + encodeURIComponent(SHIFT_GOOGLE_KEY) + '&name=' + encodeURIComponent(name) + '&v=' + encodeURIComponent(NF_SCRIPT_VERSION);
       GM_xmlhttpRequest({
         method:'GET', url, timeout:15000, anonymous:true,
         onload:r => {
@@ -4841,7 +4842,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const myName = nfRemoteMyName();
     if (!myName) return;
     try {
-      const res = await nfRemotePost({ action: 'poll_screen', name: myName });
+      const res = await nfRemotePost({ action: 'poll_screen', name: myName, version: NF_SCRIPT_VERSION });
       if (res && res.ok && res.msg && res.msg.id) {
         const lastSeen = typeof GM_getValue === 'function'
           ? GM_getValue(NF_REMOTE_SEEN_KEY, '')
