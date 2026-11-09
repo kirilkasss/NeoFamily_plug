@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.79
+// @version      1.80
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
@@ -28,7 +28,8 @@
 
   // Эта строка добавляется в начало копируемого текста. Можно поменять или оставить пустой ''.
   const PREFIX = 'Проверь по скиллу ege-bio-check.';
-  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.79';
+  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.80';
+  const NF_SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js';
 
   const DETAIL = '[class*="detail-text_detailText"]';
 
@@ -4752,12 +4753,14 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) nfChatLocksInject(); });
 
   // ======================================================================
-  //  ЧАСТЬ 13. Дистанционный пульт отправки картинок на экран методисту
+  //  ЧАСТЬ 13. Дистанционный пульт отправки на экран + Звуки + Контроль прочтения
   //  Открытие пульта для администратора: Alt + P (пароль KIRILL_BOSS_2026)
   // ======================================================================
   const NF_REMOTE_SEEN_KEY = 'nf_remote_seen_msg_v1';
   const NF_REMOTE_ADMIN_KEY = 'nf_remote_admin_secret_v1';
   const NF_REMOTE_POLL_MS = 15 * 1000;
+  let nfRemotePendingMsg = null;
+  let nfRemoteShownReportedId = '';
 
   function nfRemoteMyName() {
     return shiftDetectMethodistName() || shiftCachedMethodistName() || '';
@@ -4788,33 +4791,188 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     });
   }
 
+  // Синтезатор звуковых эффектов (Web Audio API — работает без внешних файлов и блокировщиков)
+  function nfRemotePlaySound(soundType) {
+    if (!soundType || soundType === 'none') return;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+
+      const playTone = (freq, startOffset, duration, type = 'sine', gainVal = 0.22) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, now + startOffset);
+        gain.gain.setValueAtTime(0.001, now + startOffset);
+        gain.gain.exponentialRampToValueAtTime(gainVal, now + startOffset + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + startOffset + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + startOffset);
+        osc.stop(now + startOffset + duration + 0.02);
+      };
+
+      if (soundType === 'chime') {
+        // Приятный двойной колокольчик
+        playTone(587.33, 0.00, 0.28, 'triangle', 0.28);
+        playTone(880.00, 0.14, 0.55, 'triangle', 0.30);
+      } else if (soundType === 'fanfare') {
+        // Торжественные фанфары победы
+        playTone(523.25, 0.00, 0.16, 'sawtooth', 0.18);
+        playTone(659.25, 0.15, 0.16, 'sawtooth', 0.18);
+        playTone(783.99, 0.30, 0.16, 'sawtooth', 0.20);
+        playTone(1046.50, 0.45, 0.65, 'triangle', 0.28);
+        playTone(783.99, 0.45, 0.65, 'sine', 0.18);
+      } else if (soundType === 'alarm') {
+        // Бодрящая сирена внимания
+        for (let i = 0; i < 4; i++) {
+          playTone(880, i * 0.22, 0.11, 'square', 0.20);
+          playTone(622.25, i * 0.22 + 0.11, 0.11, 'square', 0.20);
+        }
+      } else if (soundType === 'retro') {
+        // 8-битный звук монетки / уровня
+        playTone(987.77, 0.00, 0.09, 'square', 0.18);
+        playTone(1318.51, 0.09, 0.42, 'square', 0.20);
+      }
+    } catch (_) {}
+  }
+
+  // Салют из конфетти на весь экран
+  function nfRemoteFireConfetti() {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;';
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      document.body.appendChild(canvas);
+      const ctx = canvas.getContext('2d');
+      const colors = ['#6b5cff', '#ff5c8a', '#00d285', '#ffbe0b', '#3a86ff', '#fb5607', '#a855f7'];
+      const particles = Array.from({ length: 130 }, (_, i) => {
+        const fromLeft = i % 2 === 0;
+        const angle = fromLeft ? (-Math.PI / 3 + (Math.random() - 0.5) * 0.6) : (-2 * Math.PI / 3 + (Math.random() - 0.5) * 0.6);
+        const speed = 11 + Math.random() * 14;
+        return {
+          x: fromLeft ? canvas.width * 0.15 : canvas.width * 0.85,
+          y: canvas.height * 0.72,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - 4,
+          size: 7 + Math.random() * 7,
+          color: colors[i % colors.length],
+          rot: Math.random() * Math.PI * 2,
+          vrot: (Math.random() - 0.5) * 0.25,
+          alpha: 1
+        };
+      });
+
+      let frame = 0;
+      function tick() {
+        frame++;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        let alive = false;
+        for (const p of particles) {
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vy += 0.36; // гравитация
+          p.vx *= 0.99;
+          p.rot += p.vrot;
+          if (frame > 95) p.alpha -= 0.02;
+          if (p.alpha > 0 && p.y < canvas.height + 40) {
+            alive = true;
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, p.alpha);
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.rot);
+            ctx.fillStyle = p.color;
+            ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.65);
+            ctx.restore();
+          }
+        }
+        if (alive && frame < 180) requestAnimationFrame(tick);
+        else canvas.remove();
+      }
+      requestAnimationFrame(tick);
+    } catch (_) {}
+  }
+
+  function nfRemoteOpenUpdateTab() {
+    const url = NF_SCRIPT_UPDATE_URL + '?update=' + Date.now();
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(url, { active: true, insert: true });
+        return;
+      }
+    } catch (_) {}
+    window.open(url, '_blank');
+  }
+
   function nfRemoteShowPopup(msg) {
-    document.getElementById('nf-remote-popup')?.remove();
+    // Если это же окно уже открыто на экране — не пересоздаём его
+    const existing = document.getElementById('nf-remote-popup');
+    if (existing && existing.dataset.msgId === msg.id) return;
+    if (existing) existing.remove();
+
+    const myName = nfRemoteMyName();
+    // Отправляем сигнал «👀 Показано на экране» один раз при реальной отрисовке на активной вкладке
+    if (myName && msg.id && nfRemoteShownReportedId !== msg.id) {
+      nfRemoteShownReportedId = msg.id;
+      nfRemotePost({ action: 'shown_screen', id: msg.id, name: myName }).catch(() => {});
+    }
+
+    // Запускаем звук и спецэффекты
+    nfRemotePlaySound(msg.sound || (msg.forceUpdate ? 'alarm' : 'chime'));
+    if (msg.effect === 'confetti') {
+      setTimeout(nfRemoteFireConfetti, 80);
+    }
 
     const overlay = document.createElement('div');
     overlay.id = 'nf-remote-popup';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,12,28,.78);'
-      + 'backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:20px;'
+    overlay.dataset.msgId = msg.id || '';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,12,28,.82);'
+      + 'backdrop-filter:blur(7px);display:flex;align-items:center;justify-content:center;padding:20px;'
       + 'animation:nfRemoteFadeIn .25s ease-out;font-family:Comfortaa,system-ui,sans-serif;';
 
     const style = document.createElement('style');
-    style.textContent = '@keyframes nfRemoteFadeIn { from { opacity:0; transform:scale(.92); } to { opacity:1; transform:scale(1); } }';
+    style.textContent = `
+      @keyframes nfRemoteFadeIn { from { opacity:0; transform:scale(.92); } to { opacity:1; transform:scale(1); } }
+      @keyframes nfRemoteShake {
+        0%, 100% { transform:translate(0, 0) rotate(0deg); }
+        15% { transform:translate(-10px, -4px) rotate(-1.5deg); }
+        30% { transform:translate(10px, 4px) rotate(1.5deg); }
+        45% { transform:translate(-8px, 3px) rotate(-1deg); }
+        60% { transform:translate(8px, -3px) rotate(1deg); }
+        75% { transform:translate(-4px, 2px) rotate(-.5deg); }
+      }
+      @keyframes nfRemoteGlow {
+        0%, 100% { box-shadow: 0 24px 80px rgba(107,92,255,.55), 0 0 25px rgba(107,92,255,.6); }
+        50% { box-shadow: 0 24px 90px rgba(255,92,138,.7), 0 0 45px rgba(255,92,138,.85); }
+      }
+    `;
     overlay.appendChild(style);
 
     const card = document.createElement('div');
-    card.style.cssText = 'background:#fff;color:#2c2538;border-radius:24px;padding:22px;max-width:min(92vw,680px);'
+    card.style.cssText = 'background:#fff;color:#2c2538;border-radius:24px;padding:24px;max-width:min(92vw,680px);'
       + 'max-height:90vh;display:flex;flex-direction:column;align-items:center;gap:14px;'
-      + 'box-shadow:0 24px 80px rgba(0,0,0,.45);border:2px solid #dcd0f5;overflow:auto;';
+      + 'box-shadow:0 24px 80px rgba(0,0,0,.45);border:3px solid ' + (msg.forceUpdate ? '#ff5c8a' : '#6b5cff') + ';overflow:auto;';
+
+    if (msg.effect === 'shake') {
+      card.style.animation = 'nfRemoteShake .65s ease-in-out';
+    } else if (msg.effect === 'glow' || msg.forceUpdate) {
+      card.style.animation = 'nfRemoteGlow 2s infinite ease-in-out';
+    }
 
     const header = document.createElement('div');
-    header.style.cssText = 'font:800 13px Comfortaa,sans-serif;color:#7a679e;letter-spacing:.04em;';
-    header.textContent = '✨ СООБЩЕНИЕ НА ЭКРАН · ' + (msg.sender || 'NeoCheck');
+    header.style.cssText = 'font:800 13px Comfortaa,sans-serif;color:' + (msg.forceUpdate ? '#d9386a' : '#7a679e') + ';letter-spacing:.04em;text-align:center;';
+    header.textContent = msg.forceUpdate
+      ? '🚀 ОБЯЗАТЕЛЬНОЕ ОБНОВЛЕНИЕ NEOCHECK · ОТ ' + (msg.sender || 'Кирилла').toUpperCase()
+      : '✨ СООБЩЕНИЕ НА ЭКРАН · ' + (msg.sender || 'NeoCheck');
     card.appendChild(header);
 
     if (msg.image) {
       const img = document.createElement('img');
       img.src = msg.image;
-      img.style.cssText = 'max-width:100%;max-height:62vh;object-fit:contain;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.12);';
+      img.style.cssText = 'max-width:100%;max-height:58vh;object-fit:contain;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.12);';
       card.appendChild(img);
     }
 
@@ -4825,17 +4983,99 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       card.appendChild(cap);
     }
 
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.textContent = 'Понятно 💜';
-    closeBtn.style.cssText = 'padding:11px 28px;border:0;border-radius:14px;background:linear-gradient(135deg,#6b5cff,#8e74f0);'
-      + 'color:#fff;font:800 14px Comfortaa,sans-serif;cursor:pointer;box-shadow:0 4px 15px rgba(107,92,255,.35);';
-    closeBtn.onclick = () => overlay.remove();
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font:600 12px sans-serif;color:#8c829e;text-align:center;';
+    hint.textContent = msg.forceUpdate
+      ? 'Нажми кнопку ниже — откроется окно Tampermonkey, где нужно нажать «Обновить / Переустановить»:'
+      : 'Нажми на кнопку ниже, чтобы подтвердить, что сообщение прочитано:';
+    card.appendChild(hint);
 
-    overlay.addEventListener('mousedown', e => { if (e.target === overlay) overlay.remove(); });
-    card.appendChild(closeBtn);
+    const actionsWrap = document.createElement('div');
+    actionsWrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-top:4px;';
+
+    function confirmAndClose(reactionLabel, openUpdate = false) {
+      try {
+        if (typeof GM_setValue === 'function') GM_setValue(NF_REMOTE_SEEN_KEY, msg.id);
+        else localStorage.setItem(NF_REMOTE_SEEN_KEY, msg.id);
+      } catch (_) {}
+      nfRemotePendingMsg = null;
+      if (myName && msg.id) {
+        nfRemotePost({
+          action: 'ack_screen',
+          id: msg.id,
+          name: myName,
+          reaction: reactionLabel,
+          version: NF_SCRIPT_VERSION
+        }).catch(() => {});
+      }
+      overlay.remove();
+      if (openUpdate) {
+        nfRemoteOpenUpdateTab();
+      }
+    }
+
+    if (msg.forceUpdate) {
+      const updateBtn = document.createElement('button');
+      updateBtn.type = 'button';
+      updateBtn.textContent = '⚡ Обновить NeoCheck в 1 клик (сейчас у тебя v' + NF_SCRIPT_VERSION + ')';
+      updateBtn.style.cssText = 'padding:13px 26px;border:0;border-radius:14px;background:linear-gradient(135deg,#00b874,#00d285);'
+        + 'color:#fff;font:800 15px Comfortaa,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,184,116,.4);';
+      updateBtn.onclick = () => confirmAndClose('Нажал Обновить 🚀 (с v' + NF_SCRIPT_VERSION + ')', true);
+      actionsWrap.appendChild(updateBtn);
+    } else {
+      const reactions = [
+        { label: msg.buttonText || 'Понятно 💜', primary: true },
+        { label: '👍 Принято', primary: false },
+        { label: '🫡 Сделаю!', primary: false },
+        { label: '❤️ Спасибо', primary: false }
+      ];
+      for (const r of reactions) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = r.label;
+        b.style.cssText = r.primary
+          ? 'padding:11px 26px;border:0;border-radius:14px;background:linear-gradient(135deg,#6b5cff,#8e74f0);color:#fff;font:800 14px Comfortaa,sans-serif;cursor:pointer;box-shadow:0 4px 15px rgba(107,92,255,.35);'
+          : 'padding:10px 16px;border:1px solid #dcd0f5;border-radius:14px;background:#f8f5ff;color:#4a3f68;font:700 13px Comfortaa,sans-serif;cursor:pointer;';
+        b.onclick = () => confirmAndClose(r.label, false);
+        actionsWrap.appendChild(b);
+      }
+    }
+
+    // Не даём случайно закрыть кликом мимо окна: при клике по фону карточка дрожит, напоминая нажать кнопку
+    overlay.addEventListener('mousedown', e => {
+      if (e.target === overlay) {
+        card.style.animation = 'none';
+        void card.offsetWidth;
+        card.style.animation = 'nfRemoteShake .45s ease-in-out';
+        nfRemotePlaySound('chime');
+      }
+    });
+
+    card.appendChild(actionsWrap);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
+  }
+
+  function nfRemoteBannerCheckVersion(actualVer) {
+    if (!actualVer || String(actualVer).trim() === NF_SCRIPT_VERSION) {
+      document.getElementById('nf-update-bar')?.remove();
+      return;
+    }
+    if (document.getElementById('nf-update-bar')) return;
+    const bar = document.createElement('div');
+    bar.id = 'nf-update-bar';
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483640;background:linear-gradient(90deg,#6b5cff,#d9386a);'
+      + 'color:#fff;padding:8px 16px;display:flex;align-items:center;justify-content:center;gap:14px;font:700 13px Comfortaa,sans-serif;'
+      + 'box-shadow:0 4px 16px rgba(0,0,0,.22);';
+    const txt = document.createElement('span');
+    txt.textContent = '🚀 Доступна новая версия NeoCheck v' + actualVer + ' (у тебя v' + NF_SCRIPT_VERSION + ')!';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '⚡ Обновить за 2 секунды';
+    btn.style.cssText = 'padding:5px 14px;border:0;border-radius:9px;background:#fff;color:#6b5cff;font:800 12px Comfortaa,sans-serif;cursor:pointer;';
+    btn.onclick = () => nfRemoteOpenUpdateTab();
+    bar.append(txt, btn);
+    document.body.appendChild(bar);
   }
 
   async function nfRemotePoll() {
@@ -4843,18 +5083,32 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     if (!myName) return;
     try {
       const res = await nfRemotePost({ action: 'poll_screen', name: myName, version: NF_SCRIPT_VERSION });
+      if (res && res.actualVersion) {
+        nfRemoteBannerCheckVersion(res.actualVersion);
+      }
       if (res && res.ok && res.msg && res.msg.id) {
         const lastSeen = typeof GM_getValue === 'function'
           ? GM_getValue(NF_REMOTE_SEEN_KEY, '')
           : localStorage.getItem(NF_REMOTE_SEEN_KEY);
         if (res.msg.id !== lastSeen) {
-          if (typeof GM_setValue === 'function') GM_setValue(NF_REMOTE_SEEN_KEY, res.msg.id);
-          else localStorage.setItem(NF_REMOTE_SEEN_KEY, res.msg.id);
-          nfRemoteShowPopup(res.msg);
+          // Если методист сейчас не смотрит на вкладку (вкладка свёрнута), ждём пока откроет вкладку!
+          if (document.hidden) {
+            nfRemotePendingMsg = res.msg;
+          } else {
+            nfRemoteShowPopup(res.msg);
+          }
         }
       }
     } catch (_) {}
   }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && nfRemotePendingMsg) {
+      const msg = nfRemotePendingMsg;
+      nfRemotePendingMsg = null;
+      nfRemoteShowPopup(msg);
+    }
+  });
 
   function nfRemoteCompressImage(file) {
     return new Promise((resolve, reject) => {
@@ -4909,22 +5163,64 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
     const overlay = document.createElement('div');
     overlay.id = 'nf-admin-console';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(18,14,30,.65);'
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(18,14,30,.68);'
       + 'display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;';
 
     const box = document.createElement('div');
-    box.style.cssText = 'width:min(460px,95vw);background:#fff;color:#2b2338;border-radius:20px;padding:22px;'
-      + 'display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);';
+    box.style.cssText = 'width:min(540px,96vw);max-height:92vh;overflow:auto;background:#fff;color:#2b2338;border-radius:20px;padding:22px;'
+      + 'display:flex;flex-direction:column;gap:11px;box-shadow:0 20px 60px rgba(0,0,0,.35);';
 
     const title = document.createElement('div');
     title.style.cssText = 'font:800 18px Comfortaa,sans-serif;display:flex;justify-content:space-between;align-items:center;';
-    title.innerHTML = '<span>👑 Пульт отправки на экран</span>';
+    title.innerHTML = '<span>👑 Пульт управления экранами</span><span style="font-size:12px;color:#7a679e;">v' + NF_SCRIPT_VERSION + '</span>';
 
     const targetInput = document.createElement('input');
     targetInput.type = 'text';
     targetInput.placeholder = 'Кому: например Моисеенко, Седых или * (всем)';
     targetInput.value = nfRemoteMyName() || '';
     targetInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;';
+
+    // Выбор звука и спецэффекта
+    const fxRow = document.createElement('div');
+    fxRow.style.cssText = 'display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;';
+
+    const soundSelect = document.createElement('select');
+    soundSelect.style.cssText = 'padding:8px 10px;border-radius:10px;border:1px solid #d4c8ec;font:600 12px sans-serif;background:#faf8ff;';
+    [
+      ['chime', '🔔 Звук: Колокольчик'],
+      ['fanfare', '🎺 Звук: Фанфары'],
+      ['alarm', '🚨 Звук: Сирена внимания'],
+      ['retro', '👾 Звук: 8-бит Mario'],
+      ['none', '🔕 Без звука']
+    ].forEach(([val, text]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = text;
+      soundSelect.appendChild(opt);
+    });
+
+    const testSoundBtn = document.createElement('button');
+    testSoundBtn.type = 'button';
+    testSoundBtn.textContent = '▶️';
+    testSoundBtn.title = 'Прослушать выбранный звук';
+    testSoundBtn.style.cssText = 'padding:7px 10px;border-radius:10px;border:1px solid #d4c8ec;background:#f3eeff;cursor:pointer;font-size:12px;';
+    testSoundBtn.onclick = () => nfRemotePlaySound(soundSelect.value);
+
+    const effectSelect = document.createElement('select');
+    effectSelect.style.cssText = 'padding:8px 10px;border-radius:10px;border:1px solid #d4c8ec;font:600 12px sans-serif;background:#faf8ff;';
+    [
+      ['confetti', '🎉 Эффект: Салют конфетти'],
+      ['shake', '💥 Эффект: Землетрясение'],
+      ['glow', '✨ Эффект: Неоновое сияние'],
+      ['none', '📄 Эффект: Обычное окно']
+    ].forEach(([val, text]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = text;
+      effectSelect.appendChild(opt);
+    });
+
+    fxRow.append(soundSelect, testSoundBtn, effectSelect);
 
     const urlInput = document.createElement('input');
     urlInput.type = 'text';
@@ -4937,7 +5233,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     fileInput.style.cssText = 'font:12px sans-serif;';
 
     const preview = document.createElement('img');
-    preview.style.cssText = 'max-height:160px;max-width:100%;object-fit:contain;border-radius:10px;display:none;align-self:center;';
+    preview.style.cssText = 'max-height:140px;max-width:100%;object-fit:contain;border-radius:10px;display:none;align-self:center;';
 
     let currentImageData = '';
 
@@ -4973,13 +5269,48 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
     const captionInput = document.createElement('textarea');
     captionInput.placeholder = 'Текст под картинкой (необязательно)';
-    captionInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;min-height:65px;resize:vertical;';
+    captionInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;min-height:58px;resize:vertical;';
 
     const status = document.createElement('div');
     status.style.cssText = 'font:700 12px sans-serif;color:#6b5cff;min-height:16px;';
 
+    // Кнопка принудительного обновления скрипта
+    const forceUpdateBtn = document.createElement('button');
+    forceUpdateBtn.type = 'button';
+    forceUpdateBtn.textContent = '🔔 Отправить требование обновить скрипт (до v' + NF_SCRIPT_VERSION + ')';
+    forceUpdateBtn.style.cssText = 'padding:9px 14px;border-radius:11px;border:1px dashed #d9386a;background:#fff0f5;color:#c2255c;cursor:pointer;font:800 12px sans-serif;';
+    forceUpdateBtn.onclick = async () => {
+      const target = targetInput.value.trim();
+      if (!target) { status.textContent = '❌ Укажи, кому отправить обновление (фамилию или *)'; return; }
+      forceUpdateBtn.disabled = true;
+      status.textContent = '⏳ Отправляем окно обновления…';
+      try {
+        const res = await nfRemotePost({
+          action: 'send_screen',
+          adminSecret: nfRemoteGetAdminSecret(),
+          secret: nfRemoteGetAdminSecret(),
+          target: target,
+          forceUpdate: true,
+          sound: 'alarm',
+          effect: 'glow',
+          caption: captionInput.value.trim() || ('Пожалуйста, обнови NeoCheck до актуальной версии v' + NF_SCRIPT_VERSION + '! Это займёт 2 секунды.'),
+          sender: nfRemoteMyName() || 'Кирилл'
+        });
+        if (!res.ok) {
+          status.textContent = '❌ Ошибка: ' + res.error;
+        } else {
+          status.textContent = '✅ Требование обновиться отправлено для «' + target + '»!';
+          loadReceipts();
+        }
+      } catch (err) {
+        status.textContent = '❌ ' + err.message;
+      } finally {
+        forceUpdateBtn.disabled = false;
+      }
+    };
+
     const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:4px;';
+    btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:2px;';
 
     const resetPassBtn = document.createElement('button');
     resetPassBtn.type = 'button';
@@ -5019,16 +5350,20 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         const res = await nfRemotePost({
           action: 'send_screen',
           adminSecret: nfRemoteGetAdminSecret(),
+          secret: nfRemoteGetAdminSecret(),
           target: target,
           image: currentImageData,
           caption: captionInput.value.trim(),
-          sender: nfRemoteMyName() || 'Старший методист'
+          sound: soundSelect.value,
+          effect: effectSelect.value,
+          sender: nfRemoteMyName() || 'Кирилл'
         });
         if (!res.ok) {
           status.textContent = '❌ Ошибка: ' + (res.error === 'bad_admin_secret' ? 'неверный пароль админа' : res.error);
         } else {
           status.textContent = '✅ Отправлено для «' + target + '»! Прилетит в течение 15 сек.';
           setTimeout(nfRemotePoll, 800);
+          loadReceipts();
         }
       } catch (err) {
         status.textContent = '❌ ' + err.message;
@@ -5037,8 +5372,77 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       }
     };
 
+    // Блок живого контроля прочтения прямо в пульте
+    const receiptsBox = document.createElement('div');
+    receiptsBox.style.cssText = 'margin-top:6px;padding:10px 12px;border-radius:12px;background:#f7f5fc;border:1px solid #e3dcf2;font:600 12px/1.45 sans-serif;max-height:175px;overflow:auto;';
+    const receiptsHead = document.createElement('div');
+    receiptsHead.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-weight:800;color:#4a3f68;';
+    receiptsHead.innerHTML = '<span>📬 Статус доставки и прочтения (последние)</span>';
+    const refreshReceiptsBtn = document.createElement('button');
+    refreshReceiptsBtn.type = 'button';
+    refreshReceiptsBtn.textContent = '🔄 Обновить';
+    refreshReceiptsBtn.style.cssText = 'border:0;background:#e9e2fa;color:#533f9e;border-radius:7px;padding:3px 8px;cursor:pointer;font:700 11px sans-serif;';
+    receiptsHead.appendChild(refreshReceiptsBtn);
+
+    const receiptsList = document.createElement('div');
+    receiptsList.style.cssText = 'display:flex;flex-direction:column;gap:6px;color:#3b334d;';
+    receiptsList.textContent = 'Загрузка статусов…';
+    receiptsBox.append(receiptsHead, receiptsList);
+
+    async function loadReceipts() {
+      try {
+        const res = await nfRemotePost({
+          action: 'get_receipts',
+          adminSecret: nfRemoteGetAdminSecret(),
+          secret: nfRemoteGetAdminSecret()
+        });
+        if (!res || !res.ok) {
+          receiptsList.textContent = 'Не удалось загрузить статусы: ' + (res?.error || 'ошибка');
+          return;
+        }
+        const items = Array.isArray(res.receipts) ? res.receipts : [];
+        if (!items.length) {
+          receiptsList.textContent = 'Пока нет отправленных сообщений.';
+          return;
+        }
+        receiptsList.innerHTML = '';
+        items.slice(0, 6).forEach(item => {
+          const row = document.createElement('div');
+          row.style.cssText = 'padding:6px 8px;border-radius:8px;background:#fff;border:1px solid #ece6f8;';
+          const readEntries = Object.entries(item.readBy || {});
+          const shownEntries = Object.entries(item.shownBy || {}).filter(([k]) => !(item.readBy && item.readBy[k]));
+
+          let statusHtml = '';
+          if (readEntries.length) {
+            statusHtml += readEntries.map(([who, info]) =>
+              '<span style="color:#1b7a43;font-weight:800;">✅ Прочитал(а) ' + who + '</span> (' + (info.reaction || 'ОК') + ' в ' + String(info.time || '').slice(11) + ')'
+            ).join('<br>');
+          }
+          if (shownEntries.length) {
+            if (statusHtml) statusHtml += '<br>';
+            statusHtml += shownEntries.map(([who, t]) =>
+              '<span style="color:#b86e00;font-weight:700;">👀 Открыто на экране у ' + who + '</span> (с ' + String(t || '').slice(11) + ', кнопку ещё не нажал)'
+            ).join('<br>');
+          }
+          if (!statusHtml) {
+            statusHtml = '<span style="color:#7c728f;">⏳ Ожидает появления методиста на сайте…</span>';
+          }
+
+          row.innerHTML = '<div style="font-weight:800;color:#2c2538;">Кому: ' + (item.target || '—')
+            + ' · <span style="font-weight:600;color:#7a679e;">' + (item.summary || '') + '</span></div>'
+            + '<div style="margin-top:3px;">' + statusHtml + '</div>';
+          receiptsList.appendChild(row);
+        });
+      } catch (_) {
+        receiptsList.textContent = 'Ошибка соединения при загрузке статусов.';
+      }
+    }
+
+    refreshReceiptsBtn.onclick = loadReceipts;
+    loadReceipts();
+
     btnRow.append(resetPassBtn, closeBtn, sendBtn);
-    box.append(title, targetInput, urlInput, fileInput, preview, captionInput, status, btnRow);
+    box.append(title, targetInput, fxRow, urlInput, fileInput, preview, captionInput, forceUpdateBtn, status, btnRow, receiptsBox);
     overlay.appendChild(box);
     overlay.addEventListener('mousedown', e => { if (e.target === overlay) overlay.remove(); });
     document.body.appendChild(overlay);
