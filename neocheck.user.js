@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.78
+// @version      1.79
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
@@ -3872,7 +3872,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     'nf_view_prefs_v1', 'nf_work_stats_v2', 'nf_work_stats_v1',
     'nf_seen_answers_v1', 'nf_msg_base_v1', 'nf_main_chat_sent_ids_v1',
     'nf_my_shifts_v1', 'nf_my_shift_windows_v1',
-    'nf_nc_gas_cfg_v1', 'nf_methodist_full_name_v1'
+    'nf_nc_gas_cfg_v1', 'nf_methodist_full_name_v1', 'nf_remote_admin_secret_v1'
   ];
   const NF_BACKUP_MAGIC = 'neocheck-backup';
   function nfBackupGet(key) {
@@ -4750,6 +4750,327 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   window.addEventListener('pagehide', ncHoldLeave);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) nfChatLocksInject(); });
 
+  // ======================================================================
+  //  ЧАСТЬ 13. Дистанционный пульт отправки картинок на экран методисту
+  //  Открытие пульта для администратора: Alt + P (пароль KIRILL_BOSS_2026)
+  // ======================================================================
+  const NF_REMOTE_SEEN_KEY = 'nf_remote_seen_msg_v1';
+  const NF_REMOTE_ADMIN_KEY = 'nf_remote_admin_secret_v1';
+  const NF_REMOTE_POLL_MS = 15 * 1000;
+
+  function nfRemoteMyName() {
+    return shiftDetectMethodistName() || shiftCachedMethodistName() || '';
+  }
+
+  function nfRemotePost(payload) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest недоступен'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: SHIFT_GOOGLE_URL,
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        data: JSON.stringify({ key: SHIFT_GOOGLE_KEY, ...payload }),
+        timeout: 15000,
+        onload: r => {
+          try {
+            resolve(JSON.parse(r.responseText || '{}'));
+          } catch (e) {
+            reject(new Error('Ошибка ответа сервера'));
+          }
+        },
+        onerror: () => reject(new Error('Ошибка сети')),
+        ontimeout: () => reject(new Error('Таймаут'))
+      });
+    });
+  }
+
+  function nfRemoteShowPopup(msg) {
+    document.getElementById('nf-remote-popup')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'nf-remote-popup';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,12,28,.78);'
+      + 'backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:20px;'
+      + 'animation:nfRemoteFadeIn .25s ease-out;font-family:Comfortaa,system-ui,sans-serif;';
+
+    const style = document.createElement('style');
+    style.textContent = '@keyframes nfRemoteFadeIn { from { opacity:0; transform:scale(.92); } to { opacity:1; transform:scale(1); } }';
+    overlay.appendChild(style);
+
+    const card = document.createElement('div');
+    card.style.cssText = 'background:#fff;color:#2c2538;border-radius:24px;padding:22px;max-width:min(92vw,680px);'
+      + 'max-height:90vh;display:flex;flex-direction:column;align-items:center;gap:14px;'
+      + 'box-shadow:0 24px 80px rgba(0,0,0,.45);border:2px solid #dcd0f5;overflow:auto;';
+
+    const header = document.createElement('div');
+    header.style.cssText = 'font:800 13px Comfortaa,sans-serif;color:#7a679e;letter-spacing:.04em;';
+    header.textContent = '✨ СООБЩЕНИЕ НА ЭКРАН · ' + (msg.sender || 'NeoCheck');
+    card.appendChild(header);
+
+    if (msg.image) {
+      const img = document.createElement('img');
+      img.src = msg.image;
+      img.style.cssText = 'max-width:100%;max-height:62vh;object-fit:contain;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.12);';
+      card.appendChild(img);
+    }
+
+    if (msg.caption) {
+      const cap = document.createElement('div');
+      cap.style.cssText = 'font:700 18px/1.45 Comfortaa,sans-serif;color:#2c2538;text-align:center;white-space:pre-wrap;';
+      cap.textContent = msg.caption;
+      card.appendChild(cap);
+    }
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'Понятно 💜';
+    closeBtn.style.cssText = 'padding:11px 28px;border:0;border-radius:14px;background:linear-gradient(135deg,#6b5cff,#8e74f0);'
+      + 'color:#fff;font:800 14px Comfortaa,sans-serif;cursor:pointer;box-shadow:0 4px 15px rgba(107,92,255,.35);';
+    closeBtn.onclick = () => overlay.remove();
+
+    overlay.addEventListener('mousedown', e => { if (e.target === overlay) overlay.remove(); });
+    card.appendChild(closeBtn);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+  }
+
+  async function nfRemotePoll() {
+    const myName = nfRemoteMyName();
+    if (!myName) return;
+    try {
+      const res = await nfRemotePost({ action: 'poll_screen', name: myName });
+      if (res && res.ok && res.msg && res.msg.id) {
+        const lastSeen = typeof GM_getValue === 'function'
+          ? GM_getValue(NF_REMOTE_SEEN_KEY, '')
+          : localStorage.getItem(NF_REMOTE_SEEN_KEY);
+        if (res.msg.id !== lastSeen) {
+          if (typeof GM_setValue === 'function') GM_setValue(NF_REMOTE_SEEN_KEY, res.msg.id);
+          else localStorage.setItem(NF_REMOTE_SEEN_KEY, res.msg.id);
+          nfRemoteShowPopup(res.msg);
+        }
+      }
+    } catch (_) {}
+  }
+
+  function nfRemoteCompressImage(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = reject;
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = reject;
+        img.onload = () => {
+          const maxSide = 720;
+          const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+          const w = Math.round(img.width * scale);
+          const h = Math.round(img.height * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          resolve(canvas.toDataURL('image/jpeg', 0.78));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function nfRemoteGetAdminSecret() {
+    try {
+      return (typeof GM_getValue === 'function' ? GM_getValue(NF_REMOTE_ADMIN_KEY, '') : localStorage.getItem(NF_REMOTE_ADMIN_KEY)) || '';
+    } catch (_) { return ''; }
+  }
+
+  function nfRemoteSetAdminSecret(val) {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(NF_REMOTE_ADMIN_KEY, val);
+      else localStorage.setItem(NF_REMOTE_ADMIN_KEY, val);
+    } catch (_) {}
+  }
+
+  function nfRemoteOpenAdminModal() {
+    let secret = nfRemoteGetAdminSecret();
+    if (!secret) {
+      secret = prompt('Введи секретный пароль администратора пульта:') || '';
+      if (!secret.trim()) return;
+      nfRemoteSetAdminSecret(secret.trim());
+      nfRemoteAdminInject();
+    }
+
+    document.getElementById('nf-admin-console')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'nf-admin-console';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(18,14,30,.65);'
+      + 'display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;';
+
+    const box = document.createElement('div');
+    box.style.cssText = 'width:min(460px,95vw);background:#fff;color:#2b2338;border-radius:20px;padding:22px;'
+      + 'display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font:800 18px Comfortaa,sans-serif;display:flex;justify-content:space-between;align-items:center;';
+    title.innerHTML = '<span>👑 Пульт отправки на экран</span>';
+
+    const targetInput = document.createElement('input');
+    targetInput.type = 'text';
+    targetInput.placeholder = 'Кому: например Моисеенко, Седых или * (всем)';
+    targetInput.value = nfRemoteMyName() || '';
+    targetInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;';
+
+    const urlInput = document.createElement('input');
+    urlInput.type = 'text';
+    urlInput.placeholder = 'Ссылка на картинку/GIF или нажми Ctrl+V сюда';
+    urlInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;';
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/*';
+    fileInput.style.cssText = 'font:12px sans-serif;';
+
+    const preview = document.createElement('img');
+    preview.style.cssText = 'max-height:160px;max-width:100%;object-fit:contain;border-radius:10px;display:none;align-self:center;';
+
+    let currentImageData = '';
+
+    function setPreview(src) {
+      currentImageData = src;
+      if (src) {
+        preview.src = src;
+        preview.style.display = 'block';
+      } else {
+        preview.style.display = 'none';
+      }
+    }
+
+    urlInput.oninput = () => setPreview(urlInput.value.trim());
+
+    fileInput.onchange = async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      const dataUrl = await nfRemoteCompressImage(f);
+      urlInput.value = '[Картинка из файла]';
+      setPreview(dataUrl);
+    };
+
+    box.addEventListener('paste', async e => {
+      const files = e.clipboardData && e.clipboardData.files;
+      if (files && files.length && /^image\//.test(files[0].type)) {
+        e.preventDefault();
+        const dataUrl = await nfRemoteCompressImage(files[0]);
+        urlInput.value = '[Картинка из буфера обмена]';
+        setPreview(dataUrl);
+      }
+    });
+
+    const captionInput = document.createElement('textarea');
+    captionInput.placeholder = 'Текст под картинкой (необязательно)';
+    captionInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;min-height:65px;resize:vertical;';
+
+    const status = document.createElement('div');
+    status.style.cssText = 'font:700 12px sans-serif;color:#6b5cff;min-height:16px;';
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:4px;';
+
+    const resetPassBtn = document.createElement('button');
+    resetPassBtn.type = 'button';
+    resetPassBtn.textContent = '🔑 Пароль';
+    resetPassBtn.style.cssText = 'margin-right:auto;padding:9px 12px;border-radius:11px;border:1px solid #ddd;background:#f8f8f8;cursor:pointer;font:700 12px sans-serif;';
+    resetPassBtn.onclick = () => {
+      const next = prompt('Новый пароль администратора (пусто — скрыть кнопку пульта):', nfRemoteGetAdminSecret());
+      if (next !== null) {
+        nfRemoteSetAdminSecret(next.trim());
+        if (!next.trim()) {
+          document.getElementById('nf-remote-admin-btn')?.remove();
+          overlay.remove();
+        }
+      }
+    };
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'Закрыть';
+    closeBtn.style.cssText = 'padding:9px 16px;border-radius:11px;border:1px solid #ccc;background:#fff;cursor:pointer;font:700 13px sans-serif;';
+    closeBtn.onclick = () => overlay.remove();
+
+    const sendBtn = document.createElement('button');
+    sendBtn.type = 'button';
+    sendBtn.textContent = '🚀 Отправить на экран';
+    sendBtn.style.cssText = 'padding:9px 18px;border-radius:11px;border:0;background:#6b5cff;color:#fff;cursor:pointer;font:800 13px sans-serif;';
+    sendBtn.onclick = async () => {
+      const target = targetInput.value.trim();
+      if (!target) { status.textContent = '❌ Укажи, кому отправить (фамилию или *)'; return; }
+      if (!currentImageData && !captionInput.value.trim()) {
+        status.textContent = '❌ Добавь картинку или текст';
+        return;
+      }
+      sendBtn.disabled = true;
+      status.textContent = '⏳ Отправляем…';
+      try {
+        const res = await nfRemotePost({
+          action: 'send_screen',
+          adminSecret: nfRemoteGetAdminSecret(),
+          target: target,
+          image: currentImageData,
+          caption: captionInput.value.trim(),
+          sender: nfRemoteMyName() || 'Старший методист'
+        });
+        if (!res.ok) {
+          status.textContent = '❌ Ошибка: ' + (res.error === 'bad_admin_secret' ? 'неверный пароль админа' : res.error);
+        } else {
+          status.textContent = '✅ Отправлено для «' + target + '»! Прилетит в течение 15 сек.';
+          setTimeout(nfRemotePoll, 800);
+        }
+      } catch (err) {
+        status.textContent = '❌ ' + err.message;
+      } finally {
+        sendBtn.disabled = false;
+      }
+    };
+
+    btnRow.append(resetPassBtn, closeBtn, sendBtn);
+    box.append(title, targetInput, urlInput, fileInput, preview, captionInput, status, btnRow);
+    overlay.appendChild(box);
+    overlay.addEventListener('mousedown', e => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
+  function nfRemoteAdminInject() {
+    if (!nfRemoteGetAdminSecret()) return;
+    const dock = nfThemeDockInject();
+    if (!dock) return;
+    let b = document.getElementById('nf-remote-admin-btn');
+    if (b) {
+      if (b.parentElement !== dock) dock.appendChild(b);
+      return;
+    }
+    b = document.createElement('button');
+    b.id = 'nf-remote-admin-btn';
+    b.type = 'button';
+    b.className = 'nf-dock-btn';
+    b.textContent = '👑 Пульт';
+    b.title = 'Отправить картинку или сообщение на экран методисту (Alt+P)';
+    b.addEventListener('click', nfRemoteOpenAdminModal);
+    dock.appendChild(b);
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.altKey && (e.code === 'KeyP' || e.key === 'p' || e.key === 'з')) {
+      e.preventDefault();
+      nfRemoteOpenAdminModal();
+    }
+  });
+  setInterval(nfRemotePoll, NF_REMOTE_POLL_MS);
+  setTimeout(nfRemotePoll, 3500);
+
   function inject() {
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
     injectPanels();
@@ -4766,6 +5087,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     nfQuickReplyInject();
     nfFocusInject();
     nfChatLocksInject();
+    nfRemoteAdminInject();
   }
 
   let timer;
