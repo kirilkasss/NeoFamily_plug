@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.9
+// @version      2
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Копирование задания и ключа, сканер/лупа фото, режим «ключ рядом». 2) Шаблоны ответов и вложения. 3) Подсчёт заданий и выплат с гибким периодом, точным переключением ИИ/обычная и облачным восстановлением. 4) Личный график смен и быстрый регламент.
@@ -1531,6 +1531,31 @@
     return out;
   }
 
+  function normalizePrevPeriods(list) {
+    const byId = new Map();
+    for (const p of (Array.isArray(list) ? list : [])) {
+      if (!p || typeof p !== 'object' || !/^\d{4}-\d{2}-\d{2}$/.test(String(p.from || ''))) continue;
+      const id = String(p.id || ('per_' + (Number(p.closedAt) || 0) + '_' + p.from));
+      byId.set(id, {
+        id,
+        from: String(p.from),
+        to: /^\d{4}-\d{2}-\d{2}$/.test(String(p.to || '')) ? String(p.to) : '',
+        resetTs: Number(p.resetTs) > 0 ? Number(p.resetTs) : 0,
+        closedAt: Number(p.closedAt) > 0 ? Number(p.closedAt) : 0,
+        reason: String(p.reason || 'reset'),
+        works: Number(p.works) || 0,
+        neuro: Number(p.neuro) || 0,
+        regular: Number(p.regular) || 0,
+        msgs: Number(p.msgs) || 0,
+        chatMsgs: Number(p.chatMsgs) || 0,
+        money: Math.round((Number(p.money) || 0) * 100) / 100,
+        tasksSummary: String(p.tasksSummary || ''),
+        msgsSummary: String(p.msgsSummary || '')
+      });
+    }
+    return [...byId.values()].sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0)).slice(0, 10);
+  }
+
   function loadStats() {
     let s = jsonLoad(STAT_KEY, null);
     let dirtyPeriod = false;
@@ -1550,6 +1575,7 @@
     }
     s.payoutTo = /^\d{4}-\d{2}-\d{2}$/.test(String(s.payoutTo || '')) ? String(s.payoutTo) : '';
     s.payoutResetTs = Number(s.payoutResetTs) > 0 ? Number(s.payoutResetTs) : 0;
+    s.prevPeriods = normalizePrevPeriods(s.prevPeriods);
     s.rev = Number(s.rev) > 0 ? Number(s.rev) : 0;
     s.cloudKnownRev = Number(s.cloudKnownRev) > 0 ? Number(s.cloudKnownRev) : 0;
     s.lastCloudSyncAt = Number(s.lastCloudSyncAt) > 0 ? Number(s.lastCloudSyncAt) : 0;
@@ -1568,6 +1594,7 @@
   }
   function saveStats(o, opts = {}) {
     o.records = normalizeRecordList(o.records);
+    o.prevPeriods = normalizePrevPeriods(o.prevPeriods);
     o.rev = Math.max(Date.now(), (Number(o.rev) || 0) + 1);
     const ok = jsonSave(STAT_KEY, o);
     if (ok && !opts.skipCloud && typeof nfCloudSchedulePush === 'function') {
@@ -2235,6 +2262,137 @@
     }));
   }
 
+  function formatPeriodSpan(from, to, resetTs) {
+    if (to) return fmtDateRu(from) + ' – ' + fmtDateRu(to);
+    const hasResetTime = Number(resetTs) > 0 && from === dayKey(new Date(Number(resetTs)));
+    return 'с ' + fmtDateRu(from) + (hasResetTime
+      ? ' ' + new Date(Number(resetTs)).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+      : '');
+  }
+
+  function snapshotClosedPeriod(statsObj, reason) {
+    const P = periodStats(statsObj.records || [], statsObj);
+    const p = P.payout;
+    if (!p || (p.works === 0 && p.msgs === 0 && p.chatMsgs === 0 && p.money <= 0)) return null;
+    const closedAt = Date.now();
+    const snap = {
+      id: 'per_' + closedAt + '_' + Math.random().toString(36).slice(2, 6),
+      from: statsObj.payoutFrom || dayKey(),
+      to: statsObj.payoutTo || '',
+      resetTs: Number(statsObj.payoutResetTs) || 0,
+      closedAt,
+      reason: String(reason || 'reset'),
+      works: p.works,
+      neuro: p.neuro,
+      regular: p.regular,
+      msgs: p.msgs,
+      chatMsgs: p.chatMsgs,
+      money: Math.round(p.money * 100) / 100,
+      tasksSummary: p.works + ' работ / ' + (p.neuro + p.regular) + ' зад. (🤖' + p.neuro + ' ✍' + p.regular + ')',
+      msgsSummary: 'ДЗ: ' + p.msgs + ' · Чат: ' + p.chatMsgs
+    };
+    const existing = normalizePrevPeriods(statsObj.prevPeriods).filter(item =>
+      !(item.from === snap.from && (item.to || '') === snap.to && Number(item.resetTs || 0) === snap.resetTs
+        && Number(item.money || 0) === snap.money && Number(item.works || 0) === snap.works)
+    );
+    existing.unshift(snap);
+    statsObj.prevPeriods = normalizePrevPeriods(existing);
+    return snap;
+  }
+
+  function applyPeriodChange(nextFrom, nextTo, nextResetTs, reason) {
+    const x = loadStats();
+    const changed = (x.payoutFrom || '') !== nextFrom
+      || (x.payoutTo || '') !== (nextTo || '')
+      || (Number(x.payoutResetTs) || 0) !== (Number(nextResetTs) || 0);
+    if (changed) snapshotClosedPeriod(x, reason);
+    x.payoutFrom = nextFrom;
+    x.payoutTo = nextTo || '';
+    x.payoutResetTs = Number(nextResetTs) || 0;
+    saveStats(x, { immediateCloud: true });
+    forceStats();
+    return x;
+  }
+
+  function restorePrevPeriod(snapId) {
+    const x = loadStats();
+    const list = normalizePrevPeriods(x.prevPeriods);
+    const snap = list.find(p => p.id === snapId);
+    if (!snap) return false;
+    x.payoutFrom = snap.from;
+    x.payoutTo = snap.to || '';
+    x.payoutResetTs = Number(snap.resetTs) || 0;
+    x.prevPeriods = list.filter(p => p.id !== snapId);
+    saveStats(x, { immediateCloud: true });
+    forceStats();
+    toast('↩ Возвращён период: ' + formatPeriodSpan(x.payoutFrom, x.payoutTo, x.payoutResetTs));
+    return true;
+  }
+
+  function openResetZeroModal() {
+    document.getElementById('nf-reset-zero-modal')?.remove();
+    const s = loadStats();
+    const P = periodStats(s.records, s);
+    const p = P.payout;
+    const hasData = p.works > 0 || p.msgs > 0 || p.chatMsgs > 0 || p.money > 0;
+    const cloudInfo = typeof nfCloudStatusInfo === 'function' ? nfCloudStatusInfo() : {};
+
+    const cover = el('div', 'position:fixed;inset:0;z-index:2147483645;background:rgba(24,20,39,.65);display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;');
+    cover.id = 'nf-reset-zero-modal';
+    const box = el('div', 'width:min(440px,95vw);background:#fff;color:#2c2538;border-radius:18px;padding:20px;box-shadow:0 18px 55px rgba(0,0,0,.32);display:flex;flex-direction:column;gap:11px;font:13px/1.45 sans-serif;');
+
+    const title = el('div', 'font:800 17px Comfortaa,sans-serif;color:#9f2c42;', { textContent: '⚠️ Начать новый период с 0 ₽?' });
+    const summary = el('div', 'padding:9px 11px;border-radius:11px;background:#fff7f8;border:1px solid #f0ccd4;font-size:12px;color:#5a2a36;', {
+      textContent: hasData
+        ? ('Сейчас в периоде (' + formatPeriodSpan(s.payoutFrom, s.payoutTo, s.payoutResetTs) + '): '
+          + p.works + ' работ · ' + p.msgs + ' ДЗ · ' + p.chatMsgs + ' чат = ' + fmtMoney(p.money))
+        : ('Текущий период (' + formatPeriodSpan(s.payoutFrom, s.payoutTo, s.payoutResetTs) + ') уже по нулям.')
+    });
+    const info = el('div', 'font-size:12px;color:#4a4259;display:flex;flex-direction:column;gap:5px;');
+    [
+      '• Счётчик выплаты на сайте и активная сводка в таблице «Облако статистики» обнулятся и будут считать только новые работы с этой минуты — периоды не смешаются.',
+      '• Прошлые записи НЕ удаляются: они остаются в блоке «Неделя / Месяц / Архив», а сам закрытый период сохраняется в «📅 Задать период → Предыдущие периоды» и на листе «Архив периодов» в таблице.',
+      '• Если нажали случайно — всегда можно вернуть прошлый период обратно кнопкой «↩ Вернуть» внутри «📅 Задать период».'
+    ].forEach(txt => info.appendChild(el('div', '', { textContent: txt })));
+
+    box.append(title, summary, info);
+
+    if (hasData && !cloudInfo.hasPin) {
+      box.appendChild(el('div', 'padding:8px 10px;border-radius:10px;background:#fff9e6;border:1px solid #efd58c;font-size:11px;color:#6f5414;font-weight:700;', {
+        textContent: '🔐 Облако ещё не подключено: прошлый период сохранится локально в браузере, но в Google Таблицу попадёт только после нажатия «🔐 Включить облако».'
+      }));
+    }
+
+    const actions = el('div', 'display:flex;justify-content:flex-end;gap:8px;margin-top:4px;flex-wrap:wrap;');
+    const closeModal = () => {
+      document.removeEventListener('keydown', onKey);
+      cover.remove();
+    };
+    const onKey = e => { if (e.key === 'Escape') closeModal(); };
+    document.addEventListener('keydown', onKey);
+
+    const cancelBtn = el('button', 'padding:9px 16px;border-radius:10px;border:1px solid #cbbce8;background:#f7f4ff;color:#3d3257;font:700 13px sans-serif;cursor:pointer;', {
+      type: 'button', textContent: 'Отмена'
+    });
+    cancelBtn.onclick = closeModal;
+
+    const confirmBtn = el('button', 'padding:9px 16px;border-radius:10px;border:0;background:#b83f53;color:#fff;font:800 13px sans-serif;cursor:pointer;', {
+      type: 'button', textContent: '🔄 Да, начать с 0 ₽'
+    });
+    confirmBtn.onclick = () => {
+      applyPeriodChange(dayKey(), '', Date.now(), 'reset_zero');
+      closeModal();
+      toast('🔄 Новый период начат с 0 ₽! Прошлый период сохранён в «📅 Задать период».');
+    };
+
+    actions.append(cancelBtn, confirmBtn);
+    box.appendChild(actions);
+    cover.appendChild(box);
+    cover.addEventListener('mousedown', e => { if (e.target === cover) closeModal(); });
+    document.body.appendChild(cover);
+    setTimeout(() => cancelBtn.focus(), 30);
+  }
+
   function openPeriodModal() {
     document.getElementById('nf-period-modal')?.remove();
     const s = loadStats();
@@ -2242,7 +2400,7 @@
 
     const cover = el('div', 'position:fixed;inset:0;z-index:2147483645;background:rgba(24,20,39,.62);display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;');
     cover.id = 'nf-period-modal';
-    const box = el('div', 'width:min(420px,95vw);background:#fff;color:#2c2538;border-radius:18px;padding:20px;box-shadow:0 18px 55px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:12px;font:13px/1.45 sans-serif;');
+    const box = el('div', 'width:min(440px,95vw);max-height:90vh;overflow:auto;background:#fff;color:#2c2538;border-radius:18px;padding:20px;box-shadow:0 18px 55px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:12px;font:13px/1.45 sans-serif;');
     const title = el('div', 'font:800 17px Comfortaa,sans-serif;color:#2c2538;', { textContent: '📅 Период выплат' });
     const desc = el('div', 'color:#665c78;font-size:12px;', {
       textContent: 'Выбери даты расчётного периода. Старые записи сохраняются в архиве, а виджет будет считать выплату строго за выбранный период (даже после переустановки через облако).'
@@ -2296,6 +2454,39 @@
       mkPreset('📆 Весь месяц', () => { fromIn.value = ym + '-01'; toIn.value = ''; chosenResetTs = 0; syncResetNote(); })
     );
 
+    box.append(title, desc, rowDates, resetNote, presets);
+
+    const prevList = normalizePrevPeriods(s.prevPeriods);
+    if (prevList.length) {
+      const prevWrap = el('div', 'padding:9px 10px;border-radius:12px;background:#f7f5fc;border:1px solid #e1d8f3;display:flex;flex-direction:column;gap:6px;');
+      prevWrap.appendChild(el('div', 'font:800 12px sans-serif;color:#4a3f68;', {
+        textContent: '🕘 Предыдущие периоды (можно вернуть без смешивания)'
+      }));
+      prevList.slice(0, 4).forEach(item => {
+        const row = el('div', 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 8px;border-radius:9px;background:#fff;border:1px solid #ebe4f8;font-size:11px;');
+        const left = el('div', 'display:flex;flex-direction:column;gap:1px;min-width:0;');
+        const closedStr = item.closedAt
+          ? ' · закрыт ' + new Date(item.closedAt).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : '';
+        left.appendChild(el('div', 'font-weight:800;color:#2c2538;', {
+          textContent: formatPeriodSpan(item.from, item.to, item.resetTs) + ' · ' + fmtMoney(item.money)
+        }));
+        left.appendChild(el('div', 'color:#6b627d;', {
+          textContent: item.works + ' работ · ' + item.msgs + ' отв · ' + item.chatMsgs + ' чат' + closedStr
+        }));
+        const backBtn = el('button', MINI + 'flex-shrink:0;font-size:11px;padding:4px 8px;font-weight:700;color:#1b6840;border-color:#bde2cb;background:#eefaf3;', {
+          type: 'button', textContent: '↩ Вернуть', title: 'Отменить сброс и снова сделать этот период активным'
+        });
+        backBtn.onclick = () => {
+          restorePrevPeriod(item.id);
+          cover.remove();
+        };
+        row.append(left, backBtn);
+        prevWrap.appendChild(row);
+      });
+      box.appendChild(prevWrap);
+    }
+
     const actions = el('div', 'display:flex;justify-content:flex-end;gap:8px;margin-top:4px;');
     const cancelBtn = el('button', MINI, { type: 'button', textContent: 'Отмена' });
     cancelBtn.onclick = () => cover.remove();
@@ -2307,17 +2498,13 @@
       const t = toIn.value.trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(f)) { toast('Выбери корректную дату начала', true); return; }
       if (t && t < f) { toast('Дата окончания не может быть раньше начала', true); return; }
-      const x = loadStats();
-      x.payoutFrom = f;
-      x.payoutTo = t;
-      x.payoutResetTs = chosenResetTs && f === dayKey(new Date(chosenResetTs)) ? chosenResetTs : 0;
-      saveStats(x, { immediateCloud: true });
-      forceStats();
+      const nextReset = chosenResetTs && f === dayKey(new Date(chosenResetTs)) ? chosenResetTs : 0;
+      applyPeriodChange(f, t, nextReset, 'period_change');
       cover.remove();
-      toast('✅ Период выплат сохранён: с ' + fmtDateRu(f) + (t ? ' по ' + fmtDateRu(t) : ''));
+      toast('✅ Период выплат сохранён: ' + formatPeriodSpan(f, t, nextReset));
     };
     actions.append(cancelBtn, saveBtn);
-    box.append(title, desc, rowDates, resetNote, presets, actions);
+    box.appendChild(actions);
     cover.appendChild(box);
     cover.addEventListener('mousedown', e => { if (e.target === cover) cover.remove(); });
     document.body.appendChild(cover);
@@ -2432,18 +2619,9 @@
       });
       setPerBtn.onclick = openPeriodModal;
       const resetZeroBtn = el('button', MINI + 'font-size:11px;padding:4px 8px;font-weight:700;color:#9f2c42;border-color:#e8bac3;', {
-        type: 'button', textContent: '🔄 С нуля сейчас', title: 'Начать новый период выплат с нуля с этого момента (старые записи сохранятся в архиве)'
+        type: 'button', textContent: '🔄 С нуля сейчас', title: 'Начать новый период выплат с нуля с этого момента (прошлый период сохранится для возврата и в архиве)'
       });
-      resetZeroBtn.onclick = () => {
-        if (!confirm('Начать новый период выплат с нуля с этого момента?\n\nВыплата и счётчик периода обнулятся и будут считать только новые задания и сообщения.\nСтарая история сохранится в архиве.')) return;
-        const x = loadStats();
-        x.payoutFrom = dayKey();
-        x.payoutTo = '';
-        x.payoutResetTs = Date.now();
-        saveStats(x, { immediateCloud: true });
-        forceStats();
-        toast('🔄 Счётчик нового периода начат с нуля!');
-      };
+      resetZeroBtn.onclick = openResetZeroModal;
       pBtns.append(setPerBtn, resetZeroBtn);
       payoutCard.append(pTop, pSub, pBtns);
       w.appendChild(payoutCard);
@@ -5708,6 +5886,7 @@
           payoutFrom: s.payoutFrom,
           payoutTo: s.payoutTo,
           payoutResetTs: s.payoutResetTs,
+          prevPeriods: normalizePrevPeriods(s.prevPeriods),
           rev: s.rev
         }
       });
@@ -5814,6 +5993,8 @@
       const cloudRecords = Array.isArray(cloud.records) ? cloud.records : [];
       const localHadRecords = local.records.length > 0;
       const mergedRecords = normalizeRecordList(cloudRecords.concat(local.records));
+      const cloudPrevPeriods = normalizePrevPeriods(cloud.prevPeriods);
+      const mergedPrevPeriods = normalizePrevPeriods(cloudPrevPeriods.concat(local.prevPeriods || []));
 
       const takeCloudPeriod = !localHadRecords || (Number(cloud.rev || 0) >= Number(local.rev || 0));
       const merged = {
@@ -5826,6 +6007,7 @@
         payoutFrom: takeCloudPeriod && /^\d{4}-\d{2}-\d{2}$/.test(String(cloud.payoutFrom || '')) ? cloud.payoutFrom : local.payoutFrom,
         payoutTo: takeCloudPeriod && cloud.payoutTo !== undefined ? (cloud.payoutTo || '') : local.payoutTo,
         payoutResetTs: takeCloudPeriod ? (Number(cloud.payoutResetTs) || 0) : local.payoutResetTs,
+        prevPeriods: mergedPrevPeriods,
         cloudKnownRev: Number(res.meta?.rev || cloud.rev || 0),
         lastCloudSyncAt: Date.now()
       };
@@ -5848,7 +6030,7 @@
         toast('✅ Восстановлено из облака: ' + mergedRecords.length + ' зап. (период с ' + fmtDateRu(merged.payoutFrom) + ')');
       }
 
-      const shouldPushMerged = mergedRecords.length > cloudRecords.length;
+      const shouldPushMerged = mergedRecords.length > cloudRecords.length || mergedPrevPeriods.length > cloudPrevPeriods.length;
       nfCloudState.busy = false;
       forceStats();
       injectFinishModePicker();
