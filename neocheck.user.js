@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      2
+// @version      3
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Копирование задания и ключа, сканер/лупа фото, режим «ключ рядом». 2) Шаблоны ответов и вложения. 3) Подсчёт заданий и выплат с гибким периодом, точным переключением ИИ/обычная и облачным восстановлением. 4) Личный график смен и быстрый регламент.
@@ -1608,15 +1608,87 @@
     return Array.isArray(s) ? {} : s;
   }
 
-  // Есть ли у задания ответ ученика: хотя бы один символ, картинка или файл
+  const EMPTY_ANSWER_RE = /^(?:ответ\s*ученика\s*:?|нет\s*ответа|ответ\s*(?:отсутствует|не\s*дан|не\s*найден|не\s*приложен|не\s*предоставлен)|без\s*ответа|не\s*решено|не\s*выполнено)$/i;
+
+  function cleanAnswerText(raw) {
+    return String(raw || '')
+      .replace(/[\u00a0\u200b-\u200d\ufeff]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function findAnswerLabel(region) {
+    if (!region) return null;
+    const exact = [...region.querySelectorAll('span, div, p, strong, label, h1, h2, h3, h4, h5, h6')]
+      .filter(el => /^Ответ ученика\s*:?$/i.test(cleanAnswerText(el.textContent)));
+    if (exact.length) return exact[exact.length - 1];
+    return [...region.querySelectorAll('span')]
+      .find(s => s.children.length === 0 && /Ответ ученика/i.test(s.textContent || '')) || null;
+  }
+
+  function elementHasAnswerMedia(root) {
+    if (!root) return false;
+    for (const img of root.querySelectorAll('img')) {
+      const alt = (img.getAttribute('alt') || '').toLowerCase();
+      const src = (img.getAttribute('src') || '').toLowerCase();
+      if (alt.includes('avatar') || alt.includes('аватар') || src.startsWith('data:image/svg+xml')) continue;
+      return true;
+    }
+    if (root.querySelector('video, audio, canvas')) return true;
+    for (const a of root.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if (href && !href.startsWith('#')) return true;
+    }
+    return false;
+  }
+
+  // Есть ли у задания реальный ответ ученика: хотя бы 1 видимый символ (даже «.»), картинка или файл.
+  // Пустые блоки (без текста, только заголовок «Ответ ученика» или заглушка «Нет ответа») возвращают false.
   function hasStudentAnswer(card) {
     const region = card.querySelector('[role="region"]');
     if (!region) return false;
-    const label = [...region.querySelectorAll('span')].find(s => /Ответ ученика/i.test(s.textContent));
-    if (!label) return false;
-    const box = (label.parentElement && (label.parentElement.querySelector(DETAIL) || label.nextElementSibling || label.parentElement)) || null;
-    if (box) return box.textContent.trim().length > 0 || !!box.querySelector('img,a,video');
-    return !!(label.parentElement && label.parentElement.querySelector('img,a,video'));
+    const label = findAnswerLabel(region);
+    if (!label || !label.parentElement) return false;
+
+    const parent = label.parentElement;
+    const isKeySection = el => /Элементы\s+(?:ключа|ответа)|Ключ\s+ответа|Перевод\s+элементов/i.test(el.textContent || '');
+    const isExcluded = el => !el || el === label || isKeySection(el) || !!(el.closest && el.closest('button, [role="button"]'));
+
+    const candidates = [];
+    let sib = label.nextElementSibling;
+    while (sib) {
+      if (isKeySection(sib)) break;
+      if (!isExcluded(sib)) candidates.push(sib);
+      sib = sib.nextElementSibling;
+    }
+    const detailAfter = [...parent.querySelectorAll(DETAIL)].find(d =>
+      !d.contains(label)
+      && !isExcluded(d)
+      && (typeof label.compareDocumentPosition !== 'function' || Boolean(label.compareDocumentPosition(d) & 4))
+    );
+    if (detailAfter && !candidates.includes(detailAfter)) candidates.unshift(detailAfter);
+
+    for (const box of candidates) {
+      if (elementHasAnswerMedia(box)) return true;
+      const clone = box.cloneNode ? box.cloneNode(true) : null;
+      if (clone && clone.querySelectorAll) {
+        clone.querySelectorAll('button, [role="button"], svg, style, script').forEach(n => n.remove());
+      }
+      const txt = cleanAnswerText((clone || box).textContent).replace(/^Ответ ученика\s*:?\s*/i, '').trim();
+      if (txt.length > 0 && !EMPTY_ANSWER_RE.test(txt)) return true;
+    }
+
+    // Прямой текст после label внутри общего родителя без обёрточного элемента
+    let afterLabel = false;
+    for (const node of (parent.childNodes || [])) {
+      if (node === label) { afterLabel = true; continue; }
+      if (!afterLabel) continue;
+      if (node.nodeType === 3) {
+        const txt = cleanAnswerText(node.nodeValue);
+        if (txt.length > 0 && !EMPTY_ANSWER_RE.test(txt)) return true;
+      }
+    }
+    return false;
   }
 
   // Нейропроверку определяем автоматически по характерному разбору в комментариях задания.
@@ -1635,23 +1707,28 @@
     });
   }
 
-  // Запоминаем задания, в которых есть ответ ученика.
+  // Запоминаем задания, в которых есть ответ ученика (и снимаем ложную отметку, если раскрытый блок пуст).
   function trackAnswers() {
-    const found = [];
-    document.querySelectorAll('[data-task-id]').forEach(card => {
-      const id = card.getAttribute('data-task-id');
-      if (id && hasStudentAnswer(card)) found.push(id);
-    });
-    if (!found.length) return;
-
     const aid = attemptId();
     const db = loadSeen();
     const cur = db[aid] || (db[aid] = { ts: Date.now(), ids: [] });
     cur.ids = Array.isArray(cur.ids) ? cur.ids : [];
 
     let changed = false;
-    found.forEach(id => {
-      if (!cur.ids.includes(id)) { cur.ids.push(id); changed = true; }
+    document.querySelectorAll('[data-task-id]').forEach(card => {
+      const id = card.getAttribute('data-task-id');
+      if (!id) return;
+      const region = card.querySelector('[role="region"]');
+      if (!region) return;
+      const answered = hasStudentAnswer(card);
+      const idx = cur.ids.indexOf(id);
+      if (answered && idx === -1) {
+        cur.ids.push(id);
+        changed = true;
+      } else if (!answered && idx !== -1 && findAnswerLabel(region)) {
+        cur.ids.splice(idx, 1);
+        changed = true;
+      }
     });
     if (!changed) return;
 
@@ -1765,7 +1842,7 @@
     const seen = loadSeen()[p.aid] || {};
     const ids = [...new Set(Array.isArray(seen.ids) ? seen.ids : [])];
     const n = ids.length;
-    if (!n) { toast('Нет заданий с ответом ученика: в подсчёт не попало', true); return; }
+    if (!n) { toast('Пустая работа: нет заданий с ответом ученика, в оплату не засчитано', true); return; }
 
     const s = loadStats();
     // Методист самостоятельно выбирает тип домашки (ИИ или обычная)
@@ -2636,7 +2713,9 @@
       const curWorkIsNeuro = curWork ? ((Number(curWork.neuro) || 0) >= (Number(curWork.regular) || 0)) : (s.mode !== 'regular');
       modeCard.appendChild(el('div', '', {
         textContent: pm === 'check'
-          ? ('🟢 Идёт проверка. Засчитаются задания с ответом: ' + cur + ' как ' + (curWorkIsNeuro ? '🤖 ИИ' : '✍ обычная ДЗ') + ' и ответы.')
+          ? (cur > 0
+            ? ('🟢 Идёт проверка. Засчитаются задания с ответом: ' + cur + ' как ' + (curWorkIsNeuro ? '🤖 ИИ' : '✍ обычная ДЗ') + ' и ответы.')
+            : '🟡 Ответов ученика нет (0 зад.) — пустые задания в оплату не засчитаются.')
           : (curWork
             ? ('✅ Работа уже учтена: ' + ((curWork.neuro || 0) + (curWork.regular || 0)) + ' зад. (' + (curWorkIsNeuro ? '🤖 ИИ' : '✍ обычная') + ') = ' + fmtMoney(recMoney(curWork, s)))
             : ('💬 Работа уже проверена. Задания не считаются, только ответы: по ' + s.rates.msg + ' ₽.'))
@@ -5180,7 +5259,14 @@
         html[data-nf-theme="halloween"] #nf-theme-dock-menu button {color:#f7edf6;}
         html[data-nf-theme="halloween"] #nf-theme-dock-menu button:hover,
         html[data-nf-theme="halloween"] #nf-theme-dock-menu button[data-active="true"]{background:#49344f;}
-        html.nf-check-focus #tm-pink-coquette-decor,html.nf-check-focus .tm-pink-note {display:none !important;}
+        html[data-nf-theme="newyear"] #nf-quick-dock .nf-dock-btn {background:#f4f9ff;color:#1b465c;border-color:#b8d6ef;box-shadow:0 6px 20px rgba(42,102,158,.16);}
+        html[data-nf-theme="newyear"] #nf-quick-dock .nf-dock-btn:hover {background:#e5f1fc;border-color:#7fb7e2;}
+        html[data-nf-theme="newyear"] #nf-theme-dock-menu {background:#f8fbff;border-color:#b8d6ef;box-shadow:0 12px 30px rgba(42,102,158,.20);}
+        html[data-nf-theme="newyear"] #nf-theme-dock-menu button {color:#1b3650;}
+        html[data-nf-theme="newyear"] #nf-theme-dock-menu button:hover,
+        html[data-nf-theme="newyear"] #nf-theme-dock-menu button[data-active="true"]{background:#dff0fd;}
+        html.nf-check-focus #tm-pink-coquette-decor,html.nf-check-focus .tm-pink-note,
+        html.nf-check-focus #nf-ny-garland,html.nf-check-focus #nf-ny-snow {display:none !important;}
         @media(max-width:700px){#nf-quick-dock{left:10px;bottom:10px;gap:6px;}#nf-quick-dock .nf-dock-btn{height:36px;padding:0 10px;font-size:11px;}}
         @media(prefers-reduced-motion:reduce){#nf-quick-dock .nf-dock-btn{transition:none;}}
       `;
@@ -5202,7 +5288,7 @@
     const themeBtn=document.createElement('button');themeBtn.id='nf-theme-dock-toggle';themeBtn.className='nf-dock-btn';themeBtn.type='button';themeBtn.textContent='🎨 Тема';
     themeBtn.setAttribute('aria-expanded','false');
     const menu=document.createElement('div');menu.id='nf-theme-dock-menu';menu.hidden=true;
-    const options=[['pink','🎀 Pink Pick Me'],['halloween','🎃 Halloween']];
+    const options=[['pink','🎀 Pink Pick Me'],['halloween','🎃 Halloween'],['newyear','🎄 Новый год']];
     const current=()=>document.documentElement.dataset.nfTheme || (()=>{try{return localStorage.getItem(NF_THEME_STORAGE_KEY)||'pink';}catch{return 'pink';}})();
     options.forEach(([value,label])=>{
       const b=document.createElement('button');b.type='button';b.textContent=label;b.dataset.value=value;
