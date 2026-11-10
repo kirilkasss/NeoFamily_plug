@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      1.80
+// @version      1.9
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
-// @description  1) Кнопка у задания копирует условие, ключ, имя ученика и текст/фото ответа. 2) Над полем «Диалог с учеником» свои шаблоны (текст и картинки) предпросмотр прикреплённых картинок, режим «ключ рядом с ответом», подсветка совпадений с ключом и подсчёт заданий, сообщений, выплат и личный график смен
+// @description  1) Копирование задания и ключа, сканер/лупа фото, режим «ключ рядом». 2) Шаблоны ответов и вложения. 3) Подсчёт заданий и выплат с гибким периодом, точным переключением ИИ/обычная и облачным восстановлением. 4) Личный график смен и быстрый регламент.
 // @match        https://neofamily.ru/*
 // @match        https://*.neofamily.ru/*
 // @grant        GM_setClipboard
@@ -28,7 +28,7 @@
 
   // Эта строка добавляется в начало копируемого текста. Можно поменять или оставить пустой ''.
   const PREFIX = 'Проверь по скиллу ege-bio-check.';
-  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.80';
+  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.83';
   const NF_SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js';
 
   const DETAIL = '[class*="detail-text_detailText"]';
@@ -853,8 +853,10 @@
 
   function attemptId() {
     const d = document.querySelector('[id$="-dialogue"]');
-    const m = d && d.id.match(/attempt-(\d+)-dialogue/);
-    return m ? m[1] : location.pathname;
+    const m = d && d.id.match(/^attempt-(.+)-dialogue$/);
+    if (m) return m[1];
+    const u = location.pathname.match(/\/attempts?\/([^/?#]+)/i);
+    return u ? u[1] : location.pathname;
   }
 
   // ======================================================================
@@ -1101,8 +1103,8 @@
     if (!region) return null;
     const label = [...region.querySelectorAll('span')].find(s => /Ответ ученика/i.test(s.textContent));
     if (!label) return null;
-    const answerBox = label.parentElement ? label.parentElement.querySelector(DETAIL) : null;
-const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы (ключа|ответа)/i.test(d.textContent));
+    const answerBox = (label.parentElement && (label.parentElement.querySelector(DETAIL) || label.nextElementSibling || label.parentElement)) || null;
+    const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы (ключа|ответа)/i.test(d.textContent));
     if (!answerBox || !keyBox) return null;
 
     let ans = label;
@@ -1415,13 +1417,37 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       return a;
     }, { works: 0, neuro: 0, regular: 0, msgs: 0, moneyTasks: 0, moneyMsgs: 0, chatMsgs: 0, moneyChatMsgs: 0, money: 0 });
   }
+  const fmtDateRu = iso => {
+    const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return m ? (m[3] + '.' + m[2] + '.' + m[1]) : String(iso || '');
+  };
+  const defaultPayoutFrom = (now = new Date()) => {
+    const today = dayKey(now);
+    return (today >= '2026-11-10' && today <= '2026-11-25') ? '2026-11-10' : today;
+  };
+  function inPayoutPeriod(r, st) {
+    if (!r || !r.date) return false;
+    const from = st.payoutFrom || '';
+    const to = st.payoutTo || '';
+    const resetTs = Number(st.payoutResetTs) || 0;
+    if (from && r.date < from) return false;
+    if (to && r.date > to) return false;
+    if (resetTs > 0 && from && r.date === from && Number(r.ts || 0) < resetTs) return false;
+    return true;
+  }
   function periodStats(records, st, now) {
     now = now || new Date();
     const t = dayKey(now), w = weekStartKey(now), m = t.slice(0, 7);
+    const resetTs = Number(st.payoutResetTs) || 0;
+    const resetIsToday = resetTs > 0 && st.payoutFrom === t;
+    const todayRecs = records.filter(r => r.date === t);
+    const todayActiveRecs = resetIsToday ? todayRecs.filter(r => Number(r.ts || 0) >= resetTs) : todayRecs;
     return {
-      today: sumRecords(records.filter(r => r.date === t), st),
+      today: sumRecords(todayRecs, st),
+      todayActive: sumRecords(todayActiveRecs, st),
       week: sumRecords(records.filter(r => r.date >= w && r.date <= t), st),
       month: sumRecords(records.filter(r => r.date.slice(0, 7) === m), st),
+      payout: sumRecords(records.filter(r => inPayoutPeriod(r, st)), st),
       all: sumRecords(records, st)
     };
   }
@@ -1449,8 +1475,65 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
   const fmtMoney = n => (Math.round(n * 100) / 100).toLocaleString('ru-RU') + ' ₽';
 
+  function normalizeRecordList(list) {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    const workIdx = new Map();
+    const msgIds = new Set();
+
+    for (const raw of list) {
+      if (!raw || !raw.date) continue;
+      const r = { ...raw };
+      const kind = r.kind || 'work';
+      r.kind = kind;
+      r.ts = Number(r.ts) || Date.now();
+      r.neuro = Math.max(0, Math.round(Number(r.neuro) || 0));
+      r.regular = Math.max(0, Math.round(Number(r.regular) || 0));
+      r.msgs = Math.max(0, Math.round(Number(r.msgs) || 0));
+      r.chatMsgs = Math.max(0, Math.round(Number(r.chatMsgs) || 0));
+      if (r.multiplier !== undefined) {
+        const mv = Number(r.multiplier);
+        r.multiplier = Number.isFinite(mv) && mv >= 1 ? Math.min(3, Math.round(mv * 2) / 2) : 1;
+      }
+
+      if (kind === 'work') {
+        const wid = String(r.id || '').trim();
+        if (wid && workIdx.has(wid)) {
+          // Убираем случайные дубли одной и той же работы: берём более актуальное изменение, никогда не суммируем поверх!
+          const idx = workIdx.get(wid);
+          const prev = out[idx];
+          const prevVer = Number(prev.updatedAt || prev.ts || 0);
+          const curVer = Number(r.updatedAt || r.ts || 0);
+          const unionIds = [...new Set((Array.isArray(prev.taskIds) ? prev.taskIds : []).concat(Array.isArray(r.taskIds) ? r.taskIds : []))];
+          const chosen = curVer >= prevVer ? { ...r } : { ...prev };
+          if (unionIds.length) {
+            chosen.taskIds = unionIds;
+            const tot = Number(chosen.neuro) + Number(chosen.regular);
+            if (tot < unionIds.length) {
+              if (Number(chosen.neuro) >= Number(chosen.regular)) chosen.neuro = unionIds.length;
+              else chosen.regular = unionIds.length;
+            }
+          }
+          out[idx] = chosen;
+          continue;
+        }
+        if (wid) workIdx.set(wid, out.length);
+        out.push(r);
+      } else {
+        const mid = String(r.id || '').trim();
+        if (mid && mid !== 'manual' && (mid.startsWith('chat:') || mid.startsWith('m:') || mid.startsWith('chat-dom:'))) {
+          if (msgIds.has(mid)) continue;
+          msgIds.add(mid);
+        }
+        out.push(r);
+      }
+    }
+    return out;
+  }
+
   function loadStats() {
     let s = jsonLoad(STAT_KEY, null);
+    let dirtyPeriod = false;
     if (!s || Array.isArray(s)) {
       // перенос записей версии 1.12 (там были только задания; считаем их нейропроверкой)
       const old = jsonLoad('nf_work_stats_v1', null);
@@ -1461,6 +1544,15 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     s.tiers = s.tiers && typeof s.tiers === 'object' ? s.tiers : {};
     s.mode = s.mode === 'regular' ? 'regular' : 'neuro';
     s.taskComments = !!s.taskComments;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s.payoutFrom || ''))) {
+      s.payoutFrom = defaultPayoutFrom();
+      dirtyPeriod = true;
+    }
+    s.payoutTo = /^\d{4}-\d{2}-\d{2}$/.test(String(s.payoutTo || '')) ? String(s.payoutTo) : '';
+    s.payoutResetTs = Number(s.payoutResetTs) > 0 ? Number(s.payoutResetTs) : 0;
+    s.rev = Number(s.rev) > 0 ? Number(s.rev) : 0;
+    s.cloudKnownRev = Number(s.cloudKnownRev) > 0 ? Number(s.cloudKnownRev) : 0;
+    s.lastCloudSyncAt = Number(s.lastCloudSyncAt) > 0 ? Number(s.lastCloudSyncAt) : 0;
     const r = s.rates || {};
     const okList = a => Array.isArray(a) && a.length === 3 && a.every(x => Number(x) >= 0);
     s.rates = {
@@ -1470,10 +1562,19 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       chatMsg: r.chatMsg === undefined || !(Number(r.chatMsg) >= 0) ? DEF_RATES.chatMsg : Number(r.chatMsg),
       multiplier: r.multiplier === undefined || !Number.isFinite(Number(r.multiplier)) ? DEF_RATES.multiplier : Math.min(3, Math.max(1, Math.round(Number(r.multiplier) * 2) / 2))
     };
-    s.records = Array.isArray(s.records) ? s.records.filter(x => x && x.date) : [];
+    s.records = normalizeRecordList(s.records);
+    if (dirtyPeriod) jsonSave(STAT_KEY, s);
     return s;
   }
-  const saveStats = o => jsonSave(STAT_KEY, o);
+  function saveStats(o, opts = {}) {
+    o.records = normalizeRecordList(o.records);
+    o.rev = Math.max(Date.now(), (Number(o.rev) || 0) + 1);
+    const ok = jsonSave(STAT_KEY, o);
+    if (ok && !opts.skipCloud && typeof nfCloudSchedulePush === 'function') {
+      nfCloudSchedulePush(opts.immediateCloud ? 400 : 4000);
+    }
+    return ok;
+  }
 
   function loadSeen() {
     const s = jsonLoad(SEEN_KEY, {});
@@ -1486,7 +1587,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     if (!region) return false;
     const label = [...region.querySelectorAll('span')].find(s => /Ответ ученика/i.test(s.textContent));
     if (!label) return false;
-    const box = label.parentElement ? label.parentElement.querySelector(DETAIL) : null;
+    const box = (label.parentElement && (label.parentElement.querySelector(DETAIL) || label.nextElementSibling || label.parentElement)) || null;
     if (box) return box.textContent.trim().length > 0 || !!box.querySelector('img,a,video');
     return !!(label.parentElement && label.parentElement.querySelector('img,a,video'));
   }
@@ -1563,7 +1664,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     return finishButton() ? 'check' : 'checked';
   }
 
-  // Переключатель типа домашки (ИИ / обычная) прямо рядом с кнопкой «Завершить проверку»
+  // Переключатель типа домашки (ИИ / обычная) СПРАВА от кнопки «Завершить проверку» (сама кнопка — слева)
   function injectFinishModePicker() {
     const fb = finishButton();
     const existing = document.getElementById('nf-finish-mode-picker');
@@ -1572,40 +1673,53 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       return;
     }
     const s = loadStats();
-    const isNeuro = s.mode !== 'regular';
+    const aid = attemptId();
+    const curWork = s.records.find(r => (r.kind || 'work') === 'work' && String(r.id) === String(aid));
+    const effectiveMode = curWork
+      ? ((Number(curWork.neuro) || 0) >= (Number(curWork.regular) || 0) ? 'neuro' : 'regular')
+      : (s.mode === 'regular' ? 'regular' : 'neuro');
+    const isNeuro = effectiveMode !== 'regular';
     const mult = (s.rates && s.rates.multiplier >= 1) ? Number(s.rates.multiplier) : 1;
-    const sig = s.mode + ':' + mult;
+    const sig = effectiveMode + ':' + mult + ':' + (curWork ? ((curWork.neuro || 0) + '+' + (curWork.regular || 0)) : 'new');
 
     let bar = existing;
-    if (!bar || bar.parentElement !== fb.parentElement) {
+    if (!bar || bar.parentElement !== fb.parentElement || fb.nextElementSibling !== bar) {
       if (bar) bar.remove();
-      bar = el('div', 'display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:12px;border:1px solid #d9d2e9;background:#f8f6ff;margin-right:8px;flex-wrap:wrap;');
+      bar = el('div', 'display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:12px;border:1px solid #d9d2e9;background:#f8f6ff;margin-left:8px;flex-wrap:wrap;');
       bar.id = 'nf-finish-mode-picker';
-      fb.parentElement.insertBefore(bar, fb);
+      fb.insertAdjacentElement('afterend', bar);
     }
     if (bar.dataset.sig === sig) return;
     bar.dataset.sig = sig;
     bar.innerHTML = '';
 
-    bar.appendChild(el('span', 'font:700 12px sans-serif;color:#554b68;', { textContent: 'Тип ДЗ:' }));
+    bar.appendChild(el('span', 'font:700 12px sans-serif;color:#554b68;', {
+      textContent: curWork ? 'Тип ДЗ (в учёте ✓):' : 'Тип ДЗ:'
+    }));
+
+    function applyFinishModeChoice(nextMode) {
+      const x = loadStats();
+      x.mode = nextMode;
+      const nextIsNeuro = nextMode !== 'regular';
+      const wRec = x.records.find(r => (r.kind || 'work') === 'work' && String(r.id) === String(attemptId()));
+      if (wRec) {
+        const tot = (Number(wRec.neuro) || 0) + (Number(wRec.regular) || 0);
+        wRec.neuro = nextIsNeuro ? tot : 0;
+        wRec.regular = nextIsNeuro ? 0 : tot;
+        wRec.updatedAt = Date.now();
+        saveStats(x, { immediateCloud: true });
+        toast('🔄 Учтённая работа изменена на ' + (nextIsNeuro ? '🤖 ИИ' : '✍ обычную') + ' (' + tot + ' зад.)');
+      } else {
+        saveStats(x);
+      }
+      forceStats();
+      injectFinishModePicker();
+    }
+
     const bNeuro = chipBtn('🤖 ИИ', isNeuro, '#6b5cff', 'Засчитать эту домашку как ИИ-проверку');
-    bNeuro.onclick = e => {
-      e.stopPropagation();
-      const x = loadStats();
-      x.mode = 'neuro';
-      saveStats(x);
-      forceStats();
-      injectFinishModePicker();
-    };
+    bNeuro.onclick = e => { e.stopPropagation(); applyFinishModeChoice('neuro'); };
     const bReg = chipBtn('✍ Обычная', !isNeuro, '#2e7d6b', 'Засчитать эту домашку как обычную проверку');
-    bReg.onclick = e => {
-      e.stopPropagation();
-      const x = loadStats();
-      x.mode = 'regular';
-      saveStats(x);
-      forceStats();
-      injectFinishModePicker();
-    };
+    bReg.onclick = e => { e.stopPropagation(); applyFinishModeChoice('regular'); };
     bar.append(bNeuro, bReg);
     if (mult > 1) {
       bar.appendChild(el('span', 'padding:3px 7px;border-radius:8px;background:#e6f6ec;color:#276e43;font:800 11px sans-serif;', {
@@ -1635,32 +1749,43 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     };
     const activeMult = (s.rates && s.rates.multiplier >= 1) ? Number(s.rates.multiplier) : 1;
 
-    const i = s.records.findIndex(r => (r.kind || 'work') === 'work' && r.id === p.aid);
+    const i = s.records.findIndex(r => (r.kind || 'work') === 'work' && String(r.id) === String(p.aid));
 
     if (i > -1) {
       const r = s.records[i];
-      const was = (r.neuro || 0) + (r.regular || 0);
-      if (n > was) {
-        r.taskIds = [...new Set((r.taskIds || []).concat(ids))];
-        const total = r.taskIds.length;
+      const prevTotal = (Number(r.neuro) || 0) + (Number(r.regular) || 0);
+      const wasNeuro = (Number(r.neuro) || 0) >= (Number(r.regular) || 0);
+      const unionIds = [...new Set((Array.isArray(r.taskIds) ? r.taskIds : []).concat(ids))];
+      const total = Math.max(unionIds.length, prevTotal);
+      const rMult = (r.multiplier !== undefined && Number(r.multiplier) >= 1) ? Number(r.multiplier) : 1;
+      const modeChanged = wasNeuro !== isNeuro;
+      const countChanged = total !== prevTotal;
+      const multChanged = rMult !== activeMult;
+
+      if (modeChanged || countChanged || multChanged) {
+        r.taskIds = unionIds;
+        // Обновляем ровно эту запись без наложения ИИ и ручных поверх друг друга
         r.neuro = isNeuro ? total : 0;
         r.regular = isNeuro ? 0 : total;
-        saveStats(s);
-        toast('Работа обновлена: ' + total + ' зад. (' + (isNeuro ? 'ИИ' : 'обычная') + ')');
+        r.multiplier = activeMult;
+        if (p.hw && p.hw.title) r.hw = p.hw.title;
+        r.updatedAt = Date.now();
+        saveStats(s, { immediateCloud: true });
+        toast('Работа обновлена: ' + total + ' зад. (' + (isNeuro ? '🤖 ИИ' : '✍ обычная') + (activeMult > 1 ? ', ×' + activeMult : '') + ') ≈ ' + fmtMoney(recMoney(r, s)));
       } else {
-        toast('Эта работа уже учтена (' + was + ' зад.)');
+        toast('Эта работа уже учтена (' + prevTotal + ' зад., ' + (wasNeuro ? '🤖 ИИ' : '✍ обычная') + ')');
       }
       forceStats();
       return;
     }
 
     const rec = {
-      kind: 'work', mode: 'check', id: p.aid, date: dayKey(), ts: Date.now(), hw: p.hw.title,
+      kind: 'work', mode: 'check', id: String(p.aid), date: dayKey(), ts: Date.now(), hw: p.hw.title,
       neuro: counts.neuro, regular: counts.regular, multiplier: activeMult, taskIds: ids
     };
 
     s.records.push(rec);
-    saveStats(s);
+    saveStats(s, { immediateCloud: true });
     forceStats();
     toastAction(
       'Засчитано: ' + n + ' зад. (' + (isNeuro ? '🤖 ИИ' : '✍ обычная')
@@ -1698,6 +1823,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   // По умолчанию считаем «Диалог с учеником» под домашкой. Комментарии под заданиями — по галочке в панели.
   // Первый раз увидев переписку, запоминаем текущее число ответов как исходное и считаем только новые.
   const msgMem = {}; // id блока переписки -> { T, t }
+  const msgDropMem = {}; // защита от ложных провалов при частичном ререндере DOM (не сбрасываем base.n раньше времени)
 
   function msgKind(m, studentFull) {
     // data-current-user="true" надёжнее всего — это мы (методист)
@@ -1814,16 +1940,28 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         return;
       }
 
-      if (T === base.n) return;
+      if (T === base.n) {
+        delete msgDropMem[key];
+        return;
+      }
 
       // При ререндере/неполной загрузке число может временно уменьшиться.
-      // Просто синхронизируем базу, ничего не списывая и не начисляя.
+      // Ждём 8 сек стабильности, чтобы мгновенный перерендер DOM не вызвал повторного начисления при восстановлении истории.
       if (T < base.n) {
+        const dm = msgDropMem[key] || (msgDropMem[key] = { T, t: Date.now() });
+        if (dm.T !== T) {
+          dm.T = T;
+          dm.t = Date.now();
+          return;
+        }
+        if (Date.now() - dm.t < 8000) return;
         base.n = T;
         base.ts = Date.now();
+        delete msgDropMem[key];
         changed = true;
         return;
       }
+      delete msgDropMem[key];
 
       added.push({ key, delta: T - base.n, type: source.type, src: source.src });
       base.n = T;
@@ -1903,6 +2041,16 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       html:not([data-nf-theme="halloween"]) .nf-stats-widget .nf-stats-summary-card {
         background:#fff8e7 !important;color:#5f4a20 !important;-webkit-text-fill-color:#5f4a20 !important;
       }
+      html:not([data-nf-theme="halloween"]) .nf-stats-widget .nf-stats-payout-card {
+        background:linear-gradient(135deg,#eef9f2,#f3f0ff) !important;color:#1f4e3a !important;-webkit-text-fill-color:#1f4e3a !important;
+        border:1px solid #bfe3ce !important;
+      }
+      html:not([data-nf-theme="halloween"]) .nf-stats-widget .nf-stats-payout-card .nf-payout-sub {
+        color:#4b5e54 !important;-webkit-text-fill-color:#4b5e54 !important;
+      }
+      html:not([data-nf-theme="halloween"]) .nf-stats-widget .nf-stats-cloud-box {
+        background:#f2f6ff !important;border:1px solid #d2e0fa !important;color:#2c4670 !important;-webkit-text-fill-color:#2c4670 !important;
+      }
       html:not([data-nf-theme="halloween"]) .nf-stats-widget .nf-stats-mode-card {
         color:#333 !important;-webkit-text-fill-color:#333 !important;
       }
@@ -1927,6 +2075,16 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       html[data-nf-theme="halloween"] .nf-stats-widget .nf-stats-summary-card {
         background:#3b2d42 !important;color:#ffe8bf !important;-webkit-text-fill-color:#ffe8bf !important;
         border:1px solid #76566f !important;
+      }
+      html[data-nf-theme="halloween"] .nf-stats-widget .nf-stats-payout-card {
+        background:#283938 !important;color:#c9f7e1 !important;-webkit-text-fill-color:#c9f7e1 !important;
+        border:1px solid #4d8174 !important;
+      }
+      html[data-nf-theme="halloween"] .nf-stats-widget .nf-stats-payout-card .nf-payout-sub {
+        color:#b5d7ca !important;-webkit-text-fill-color:#b5d7ca !important;
+      }
+      html[data-nf-theme="halloween"] .nf-stats-widget .nf-stats-cloud-box {
+        background:#2b2d46 !important;border:1px solid #596094 !important;color:#dde5ff !important;-webkit-text-fill-color:#dde5ff !important;
       }
       html[data-nf-theme="halloween"] .nf-stats-widget .nf-stats-mode-card {
         background:#382c41 !important;color:#f5eaf4 !important;-webkit-text-fill-color:#f5eaf4 !important;
@@ -2026,24 +2184,6 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
   function forceStats() { if (statsWidget) statsWidget._sig = null; renderStats(); }
 
-  function downloadCsv(st) {
-    const q = v => '"' + String(v).replace(/"/g, '""') + '"';
-    const num = v => String(v).replace('.', ',');
-    const page = r => r.mode === 'check' ? 'на проверке' : r.mode === 'checked' ? 'уже проверена' : '';
-    const rows = st.records.slice().sort((a, b) => a.ts - b.ts).map(r => [
-      r.date, r.kind === 'chat_msg' ? 'сообщение основного чата' : (r.kind || 'work') === 'msg' ? 'сообщение домашки' : 'работа', page(r), q(r.hw || ''),
-      r.neuro || 0, r.regular || 0, r.msgs || 0, r.chatMsgs || 0, TIER_LABEL[tierOf(st, r.date)], num(recMoney(r, st).toFixed(2))
-    ].join(';'));
-    const text = '\uFEFF' + ['Дата;Тип;Страница;Домашка;Нейро-заданий;Обычных заданий;Ответов под домашками;Сообщений в чатах;Оценка месяца;Сумма']
-      .concat(rows).join('\r\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
-    a.download = 'proverki_' + dayKey() + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-  }
-
   function chipBtn(text, on, color, title) {
     return el('button', 'padding:6px 12px;border-radius:999px;border:1px solid ' + color + ';font:700 13px sans-serif;cursor:pointer;'
       + 'background:' + (on ? color : '#fff') + ';color:' + (on ? '#fff' : color) + ';', { type: 'button', textContent: text, title: title || '' });
@@ -2095,39 +2235,115 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     }));
   }
 
-  // Ручная поправка числа сообщений основного чата за выбранный день
-  function fixChatDay() {
+  function openPeriodModal() {
+    document.getElementById('nf-period-modal')?.remove();
     const s = loadStats();
-    const date = prompt('За какую дату поправить (ГГГГ-ММ-ДД)?', dayKey());
-    if (!date) return;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date.trim())) { toast('Нужен формат ГГГГ-ММ-ДД', true); return; }
-    const d = date.trim();
-    const cur = s.records.filter(r => r.date === d && r.chatMsgs).reduce((n, r) => n + (Number(r.chatMsgs) || 0), 0);
-    const ans = prompt('Сколько сообщений в чате было на самом деле? Сейчас в учёте: ' + cur, String(cur));
-    if (ans === null) return;
-    const n = parseInt(ans, 10);
-    if (!(n >= 0)) { toast('Нужно число', true); return; }
-    s.records = s.records.filter(r => !(r.date === d && r.chatMsgs));
-    if (n > 0) s.records.push({ kind: 'chat_msg', id: 'manual-chat:' + d + ':' + Date.now(),
-      date: d, ts: Date.now(), hw: '(основной чат, вручную)', chatMsgs: n });
-    saveStats(s);
-    forceStats();
-    toast('Чат за ' + d + ': ' + n + ' сообщ.');
+    const today = dayKey();
+
+    const cover = el('div', 'position:fixed;inset:0;z-index:2147483645;background:rgba(24,20,39,.62);display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;');
+    cover.id = 'nf-period-modal';
+    const box = el('div', 'width:min(420px,95vw);background:#fff;color:#2c2538;border-radius:18px;padding:20px;box-shadow:0 18px 55px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:12px;font:13px/1.45 sans-serif;');
+    const title = el('div', 'font:800 17px Comfortaa,sans-serif;color:#2c2538;', { textContent: '📅 Период выплат' });
+    const desc = el('div', 'color:#665c78;font-size:12px;', {
+      textContent: 'Выбери даты расчётного периода. Старые записи сохраняются в архиве, а виджет будет считать выплату строго за выбранный период (даже после переустановки через облако).'
+    });
+
+    const rowDates = el('div', 'display:grid;grid-template-columns:1fr 1fr;gap:10px;');
+    const fromWrap = el('label', 'display:flex;flex-direction:column;gap:4px;font-weight:700;font-size:12px;color:#4a3f68;', { textContent: 'С даты:' });
+    const fromIn = el('input', 'padding:8px 10px;border-radius:10px;border:1px solid #cbbce8;font:600 13px sans-serif;color:#222;background:#faf8ff;', {
+      type: 'date', value: s.payoutFrom || today
+    });
+    fromWrap.appendChild(fromIn);
+
+    const toWrap = el('label', 'display:flex;flex-direction:column;gap:4px;font-weight:700;font-size:12px;color:#4a3f68;', { textContent: 'По дату (пусто = по сегодня):' });
+    const toIn = el('input', 'padding:8px 10px;border-radius:10px;border:1px solid #cbbce8;font:600 13px sans-serif;color:#222;background:#faf8ff;', {
+      type: 'date', value: s.payoutTo || ''
+    });
+    toWrap.appendChild(toIn);
+    rowDates.append(fromWrap, toWrap);
+
+    let chosenResetTs = s.payoutResetTs || 0;
+    const resetNote = el('div', 'font-size:11px;color:#2e7d6b;font-weight:700;min-height:14px;');
+    function syncResetNote() {
+      if (chosenResetTs > 0 && fromIn.value === dayKey(new Date(chosenResetTs))) {
+        const tm = new Date(chosenResetTs).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        resetNote.textContent = '⏱ Точный старт от сброса: ' + fmtDateRu(fromIn.value) + ' в ' + tm;
+      } else {
+        resetNote.textContent = '';
+      }
+    }
+    syncResetNote();
+    fromIn.onchange = () => { chosenResetTs = 0; syncResetNote(); };
+    toIn.onchange = () => { chosenResetTs = 0; syncResetNote(); };
+
+    const presets = el('div', 'display:flex;flex-wrap:wrap;gap:6px;');
+    const mkPreset = (txt, fn, accent = '#6b5cff') => {
+      const b = el('button', 'padding:6px 10px;border-radius:9px;border:1px solid #d5cbed;background:#f7f4ff;color:' + accent + ';font:700 11px sans-serif;cursor:pointer;', {
+        type: 'button', textContent: txt
+      });
+      b.onclick = fn;
+      return b;
+    };
+
+    const now = new Date();
+    const ym = today.slice(0, 7);
+    const lastDayNum = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    presets.append(
+      mkPreset('🟢 С сегодняшнего дня', () => { fromIn.value = today; toIn.value = ''; chosenResetTs = 0; syncResetNote(); }, '#2e7d6b'),
+      mkPreset('🧹 В 0 с этой минуты', () => { fromIn.value = today; toIn.value = ''; chosenResetTs = Date.now(); syncResetNote(); }, '#b83f53'),
+      mkPreset('📆 1–15 число', () => { fromIn.value = ym + '-01'; toIn.value = ym + '-15'; chosenResetTs = 0; syncResetNote(); }),
+      mkPreset('📆 16–конец месяца', () => { fromIn.value = ym + '-16'; toIn.value = ym + '-' + pad2(lastDayNum); chosenResetTs = 0; syncResetNote(); }),
+      mkPreset('📆 Весь месяц', () => { fromIn.value = ym + '-01'; toIn.value = ''; chosenResetTs = 0; syncResetNote(); })
+    );
+
+    const actions = el('div', 'display:flex;justify-content:flex-end;gap:8px;margin-top:4px;');
+    const cancelBtn = el('button', MINI, { type: 'button', textContent: 'Отмена' });
+    cancelBtn.onclick = () => cover.remove();
+    const saveBtn = el('button', 'padding:8px 16px;border-radius:10px;border:0;background:#6b5cff;color:#fff;font:700 13px sans-serif;cursor:pointer;', {
+      type: 'button', textContent: '💾 Сохранить период'
+    });
+    saveBtn.onclick = () => {
+      const f = fromIn.value.trim();
+      const t = toIn.value.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(f)) { toast('Выбери корректную дату начала', true); return; }
+      if (t && t < f) { toast('Дата окончания не может быть раньше начала', true); return; }
+      const x = loadStats();
+      x.payoutFrom = f;
+      x.payoutTo = t;
+      x.payoutResetTs = chosenResetTs && f === dayKey(new Date(chosenResetTs)) ? chosenResetTs : 0;
+      saveStats(x, { immediateCloud: true });
+      forceStats();
+      cover.remove();
+      toast('✅ Период выплат сохранён: с ' + fmtDateRu(f) + (t ? ' по ' + fmtDateRu(t) : ''));
+    };
+    actions.append(cancelBtn, saveBtn);
+    box.append(title, desc, rowDates, resetNote, presets, actions);
+    cover.appendChild(box);
+    cover.addEventListener('mousedown', e => { if (e.target === cover) cover.remove(); });
+    document.body.appendChild(cover);
   }
 
   function renderStats() {
     const w = statsWidget;
     if (!w) return;
     const s = loadStats();
-    const cur = ((loadSeen()[attemptId()] || {}).ids || []).length;
+    const aid = attemptId();
+    const cur = ((loadSeen()[aid] || {}).ids || []).length;
     if (!w._month) w._month = dayKey().slice(0, 7);
-    const sig = JSON.stringify([s, cur, dayKey(), w._month, pageMode()]);
+    if (!w._workScope) w._workScope = 'today';
+    const cloudInfo = typeof nfCloudStatusInfo === 'function' ? nfCloudStatusInfo() : {};
+    const sig = JSON.stringify([s, cur, dayKey(), w._month, w._workScope, pageMode(), aid, cloudInfo]);
     if (w._sig === sig) return;
     w._sig = sig;
     const P = periodStats(s.records, s);
     w.innerHTML = '';
 
-    const tasksToday = P.today.neuro + P.today.regular;
+    const tasksToday = P.todayActive.neuro + P.todayActive.regular;
+    const periodLabelText = s.payoutTo
+      ? (fmtDateRu(s.payoutFrom) + ' – ' + fmtDateRu(s.payoutTo))
+      : ('с ' + fmtDateRu(s.payoutFrom) + (s.payoutResetTs > 0 && s.payoutFrom === dayKey(new Date(s.payoutResetTs))
+        ? ' ' + new Date(s.payoutResetTs).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+        : ''));
 
     // Компактный режим по умолчанию: одна строка с главными счётчиками.
     if (!w._expanded) {
@@ -2139,11 +2355,17 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       w.style.overflow = 'visible';
 
       const compact = el('div', 'display:flex;align-items:center;gap:7px;padding:9px 11px;cursor:grab;user-select:none;white-space:nowrap;');
-      compact.title = 'Перетащи в удобное место. Клик — открыть полную статистику';
+      compact.title = 'Период: ' + periodLabelText + '. Перетащи или кликни, чтобы открыть статистику';
       compact.appendChild(el('span', 'font:800 14px sans-serif;line-height:1;', { textContent: '📊' }));
       compact.appendChild(el('span', 'font:800 12px sans-serif;color:#2b2b2b;', {
-        textContent: tasksToday + ' ДЗ · ' + P.today.msgs + ' ответов · ' + P.today.chatMsgs + ' чат'
+        textContent: tasksToday + ' ДЗ · ' + P.todayActive.msgs + ' отв · ' + P.todayActive.chatMsgs + ' чат · 💰 ' + fmtMoney(P.payout.money)
       }));
+      if (cloudInfo.pendingRestore) {
+        compact.appendChild(el('span', 'font:800 11px sans-serif;padding:2px 6px;border-radius:7px;background:#e6f6ec;color:#1b7a43;', {
+          textContent: '☁️',
+          title: 'В облаке найдена сохранённая статистика — нажми для восстановления'
+        }));
+      }
       compact.appendChild(el('span', 'font:900 12px sans-serif;color:#9a7b45;margin-left:2px;', { textContent: '▾' }));
       installStatsDrag(compact, w);
       compact.addEventListener('click', e => {
@@ -2156,9 +2378,9 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     }
 
     // Полная статистика раскрывается из той же точки и может быть снова свернута.
-    w.style.width = 'min(360px, calc(100vw - 16px))';
+    w.style.width = 'min(370px, calc(100vw - 16px))';
     w.style.minWidth = '300px';
-    w.style.maxWidth = '360px';
+    w.style.maxWidth = '370px';
     w.style.height = 'auto';
     w.style.padding = '9px 10px';
     w.style.overflow = 'hidden auto';
@@ -2182,23 +2404,86 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
     {
       const summaryCard = el('div', 'padding:7px 8px;border-radius:9px;background:#fff8e7;font:700 12px sans-serif;color:#5f4a20;', {
-        textContent: 'Сегодня: ' + tasksToday + ' ДЗ · ' + P.today.msgs + ' ответов · ' + P.today.chatMsgs + ' чат · ' + fmtMoney(P.today.money)
+        textContent: 'Сегодня: ' + tasksToday + ' ДЗ · ' + P.todayActive.msgs + ' отв · ' + P.todayActive.chatMsgs + ' чат · ' + fmtMoney(P.todayActive.money)
       });
       summaryCard.className = 'nf-stats-summary-card';
       w.appendChild(summaryCard);
     }
 
+    // Карточка расчётного периода выплат + быстрый сброс с нуля
+    {
+      const payoutCard = el('div', 'padding:8px 9px;border-radius:10px;display:flex;flex-direction:column;gap:5px;');
+      payoutCard.className = 'nf-stats-payout-card';
+      const pTop = el('div', 'display:flex;justify-content:space-between;align-items:center;gap:6px;font:800 13px sans-serif;');
+      pTop.appendChild(el('span', '', { textContent: '💰 Период (' + periodLabelText + ')' }));
+      pTop.appendChild(el('span', 'font:900 14px sans-serif;', { textContent: fmtMoney(P.payout.money) }));
+
+      const pSub = el('div', 'font:600 11px sans-serif;');
+      pSub.className = 'nf-payout-sub';
+      pSub.textContent = 'задания ' + (P.payout.neuro + P.payout.regular)
+        + ' (🤖' + P.payout.neuro + ' ✍' + P.payout.regular + ') = ' + fmtMoney(P.payout.moneyTasks)
+        + ' · ответы ДЗ ' + P.payout.msgs + ' = ' + fmtMoney(P.payout.moneyMsgs)
+        + ' · чат ' + P.payout.chatMsgs + ' = ' + fmtMoney(P.payout.moneyChatMsgs)
+        + ' · работ ' + P.payout.works;
+
+      const pBtns = el('div', 'display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;');
+      const setPerBtn = el('button', MINI + 'font-size:11px;padding:4px 8px;font-weight:700;', {
+        type: 'button', textContent: '📅 Задать период', title: 'Выбрать даты расчётного периода (сохранится и в облаке)'
+      });
+      setPerBtn.onclick = openPeriodModal;
+      const resetZeroBtn = el('button', MINI + 'font-size:11px;padding:4px 8px;font-weight:700;color:#9f2c42;border-color:#e8bac3;', {
+        type: 'button', textContent: '🔄 С нуля сейчас', title: 'Начать новый период выплат с нуля с этого момента (старые записи сохранятся в архиве)'
+      });
+      resetZeroBtn.onclick = () => {
+        if (!confirm('Начать новый период выплат с нуля с этого момента?\n\nВыплата и счётчик периода обнулятся и будут считать только новые задания и сообщения.\nСтарая история сохранится в архиве.')) return;
+        const x = loadStats();
+        x.payoutFrom = dayKey();
+        x.payoutTo = '';
+        x.payoutResetTs = Date.now();
+        saveStats(x, { immediateCloud: true });
+        forceStats();
+        toast('🔄 Счётчик нового периода начат с нуля!');
+      };
+      pBtns.append(setPerBtn, resetZeroBtn);
+      payoutCard.append(pTop, pSub, pBtns);
+      w.appendChild(payoutCard);
+    }
+
     const pm = pageMode();
     if (pm) {
-      const modeCard = el('div', 'padding:6px 8px;border-radius:8px;font:12px sans-serif;color:#333;background:'
-        + (pm === 'check' ? '#e6f6ec' : '#eef3ff') + ';', {
-        textContent: pm === 'check'
-          ? '🟢 Идёт проверка. Засчитаются задания с ответом ученика: '
-            + cur + ' как ' + (s.mode === 'regular' ? '✍ обычная ДЗ' : '🤖 ИИ-проверка') + ' и ответы на сообщения.'
-          : '💬 Работа уже проверена (кнопки «Завершить проверку» нет). Задания не считаются, '
-            + 'только ответы на сообщения: по ' + s.rates.msg + ' ₽.'
-      });
+      const curWork = s.records.find(r => (r.kind || 'work') === 'work' && String(r.id) === String(aid));
+      const modeCard = el('div', 'padding:6px 8px;border-radius:8px;font:12px sans-serif;color:#333;display:flex;flex-direction:column;gap:5px;background:'
+        + (pm === 'check' ? '#e6f6ec' : '#eef3ff') + ';');
       modeCard.className = 'nf-stats-mode-card';
+      const curWorkIsNeuro = curWork ? ((Number(curWork.neuro) || 0) >= (Number(curWork.regular) || 0)) : (s.mode !== 'regular');
+      modeCard.appendChild(el('div', '', {
+        textContent: pm === 'check'
+          ? ('🟢 Идёт проверка. Засчитаются задания с ответом: ' + cur + ' как ' + (curWorkIsNeuro ? '🤖 ИИ' : '✍ обычная ДЗ') + ' и ответы.')
+          : (curWork
+            ? ('✅ Работа уже учтена: ' + ((curWork.neuro || 0) + (curWork.regular || 0)) + ' зад. (' + (curWorkIsNeuro ? '🤖 ИИ' : '✍ обычная') + ') = ' + fmtMoney(recMoney(curWork, s)))
+            : ('💬 Работа уже проверена. Задания не считаются, только ответы: по ' + s.rates.msg + ' ₽.'))
+      }));
+      if (curWork) {
+        const quickFlip = el('button', MINI + 'align-self:flex-start;font-size:11px;padding:4px 8px;font-weight:700;', {
+          type: 'button',
+          textContent: curWorkIsNeuro ? '⇄ Изменить эту работу на ✍ Обычную' : '⇄ Изменить эту работу на 🤖 ИИ',
+          title: 'Переключить тип уже учтённой работы без дублирования'
+        });
+        quickFlip.onclick = () => {
+          const t = loadStats();
+          const x = t.records.find(z => (z.kind || 'work') === 'work' && String(z.id) === String(aid));
+          if (!x) return;
+          const tot = (Number(x.neuro) || 0) + (Number(x.regular) || 0);
+          if ((Number(x.neuro) || 0) >= (Number(x.regular) || 0)) { x.neuro = 0; x.regular = tot; }
+          else { x.neuro = tot; x.regular = 0; }
+          x.updatedAt = Date.now();
+          saveStats(t, { immediateCloud: true });
+          forceStats();
+          injectFinishModePicker();
+          toast('🔄 Работа переключена: ' + ((x.neuro || 0) > 0 ? '🤖 ИИ' : '✍ обычная') + ' (' + tot + ' зад.)');
+        };
+        modeCard.appendChild(quickFlip);
+      }
       w.appendChild(modeCard);
     }
 
@@ -2217,7 +2502,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const trow = el('div', 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;');
     TIERS.forEach(t => {
       const b = chipBtn(TIER_LABEL[t], t === tier, '#c77700', 'Оценка за этот месяц: суммы за него пересчитаются');
-      b.onclick = () => { const x = loadStats(); x.tiers[w._month] = t; saveStats(x); forceStats(); };
+      b.onclick = () => { const x = loadStats(); x.tiers[w._month] = t; saveStats(x, { immediateCloud: true }); forceStats(); };
       trow.appendChild(b);
     });
     const gear = el('button', MINI, { type: 'button', textContent: '⚙ Ставки', title: 'Изменить ставки' });
@@ -2236,7 +2521,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         return;
       }
       x.rates = { regular: reg, neuro: neu, msg, chatMsg, multiplier: x.rates.multiplier || 1 };
-      saveStats(x);
+      saveStats(x, { immediateCloud: true });
       forceStats();
     };
     const resetRates = el('button', MINI, { type: 'button', textContent: '↺ Сбросить ставки', title: 'Вернуть ставки по умолчанию: обычные 5/6/7, нейро 2/3/4, ДЗ 2, чат 9' });
@@ -2244,7 +2529,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       if (!confirm('Сбросить ставки на стандартные?\nОбычные: 5,6,7 ₽\nНейро: 2,3,4 ₽\nДЗ: 2 ₽\nЧат: 9 ₽')) return;
       const x = loadStats();
       x.rates = { regular: DEF_RATES.regular.slice(), neuro: DEF_RATES.neuro.slice(), msg: DEF_RATES.msg, chatMsg: DEF_RATES.chatMsg, multiplier: x.rates.multiplier || 1 };
-      saveStats(x);
+      saveStats(x, { immediateCloud: true });
       forceStats();
     };
     trow.append(gear, resetRates);
@@ -2311,7 +2596,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     factorBox.append(factorTop, slider, ticks);
     w.appendChild(factorBox);
 
-    // периоды
+    // календарные периоды
     const line = (name, x) => {
       const d = el('div', 'font:13px sans-serif;color:#333;');
       d.appendChild(el('div', 'font-weight:700;', { textContent: name + ': ' + fmtMoney(x.money) }));
@@ -2323,31 +2608,48 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       return d;
     };
     const per = el('div', 'display:flex;flex-direction:column;gap:4px;margin-top:4px;');
-    per.append(line('Сегодня', P.today), line('Неделя', P.week), line('Месяц', P.month), line('Всего', P.all));
+    per.append(line('Неделя', P.week), line('Месяц', P.month), line('Архив (за всё время)', P.all));
     w.appendChild(per);
 
-    // записи за сегодня
-    const todayRecs = s.records.filter(r => r.date === dayKey()).sort((a, b) => a.ts - b.ts);
-    const works = todayRecs.filter(r => (r.kind || 'work') === 'work');
-    if (works.length) {
-      w.appendChild(el('div', 'font:700 12px sans-serif;color:#777;margin-top:4px;', { textContent: 'Сегодня засчитано:' }));
-      works.forEach(r => {
+    // записи (переключение Сегодня / Весь период)
+    const todayWorks = s.records.filter(r => r.date === dayKey() && (r.kind || 'work') === 'work').sort((a, b) => b.ts - a.ts);
+    const periodWorks = s.records.filter(r => inPayoutPeriod(r, s) && (r.kind || 'work') === 'work').sort((a, b) => b.ts - a.ts);
+    const shownWorks = w._workScope === 'period' ? periodWorks : todayWorks;
+
+    if (todayWorks.length || periodWorks.length) {
+      const workHead = el('div', 'display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:4px;');
+      workHead.appendChild(el('span', 'font:700 12px sans-serif;color:#777;', {
+        textContent: w._workScope === 'period' ? ('Работы периода (' + periodWorks.length + '):') : ('Сегодня засчитано (' + todayWorks.length + '):')
+      }));
+      const scopeToggle = el('button', MINI + 'font-size:11px;padding:3px 7px;', {
+        type: 'button',
+        textContent: w._workScope === 'period' ? ('Только сегодня (' + todayWorks.length + ')') : ('Весь период (' + periodWorks.length + ')')
+      });
+      scopeToggle.onclick = () => { w._workScope = w._workScope === 'period' ? 'today' : 'period'; renderStats(); };
+      workHead.appendChild(scopeToggle);
+      w.appendChild(workHead);
+
+      const worksList = el('div', 'display:flex;flex-direction:column;gap:4px;max-height:170px;overflow:auto;');
+      shownWorks.forEach(r => {
         const row = el('div', 'display:flex;gap:4px;align-items:center;justify-content:space-between;font:12px sans-serif;color:#333;');
         const title = r.hw || 'Без названия';
         const rMult = (r.multiplier !== undefined && Number(r.multiplier) > 1) ? ' · ×' + Number(r.multiplier) : '';
+        const dateTag = w._workScope === 'period' ? (fmtDateRu(r.date).slice(0, 5) + ' ') : '';
         row.appendChild(el('span', 'max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;', {
-          textContent: '🤖' + (r.neuro || 0) + ' ✍' + (r.regular || 0) + rMult + ' · ' + fmtMoney(recMoney(r, s)) + ' · ' + title, title
+          textContent: dateTag + '🤖' + (r.neuro || 0) + ' ✍' + (r.regular || 0) + rMult + ' · ' + fmtMoney(recMoney(r, s)) + ' · ' + title, title
         }));
         const flip = el('button', MINI, { type: 'button', textContent: '⇄', title: 'Переключить эту работу между ИИ и Обычной' });
         flip.onclick = () => {
           const t = loadStats();
-          const x = t.records.find(z => z.id === r.id && z.ts === r.ts);
+          const x = t.records.find(z => (z.kind || 'work') === 'work' && String(z.id) === String(r.id));
           if (x) {
             const tot = (Number(x.neuro) || 0) + (Number(x.regular) || 0);
             if ((Number(x.neuro) || 0) >= (Number(x.regular) || 0)) { x.neuro = 0; x.regular = tot; }
             else { x.neuro = tot; x.regular = 0; }
-            saveStats(t);
+            x.updatedAt = Date.now();
+            saveStats(t, { immediateCloud: true });
             forceStats();
+            injectFinishModePicker();
           }
         };
         const ed = el('button', MINI, { type: 'button', textContent: '✎', title: 'Изменить число заданий и коэффициент' });
@@ -2360,55 +2662,53 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
           const mVal = c === undefined ? curMult : parseFloat(String(c).replace(',', '.'));
           if (!(n1 >= 0) || !(n2 >= 0) || !(mVal >= 1)) { toast('Проверьте введённые числа', true); return; }
           const t = loadStats();
-          const x = t.records.find(z => z.id === r.id && z.ts === r.ts);
-          if (x) { x.neuro = n1; x.regular = n2; x.multiplier = Math.min(3, Math.max(1, mVal)); saveStats(t); forceStats(); }
+          const x = t.records.find(z => (z.kind || 'work') === 'work' && String(z.id) === String(r.id));
+          if (x) {
+            x.neuro = n1;
+            x.regular = n2;
+            x.multiplier = Math.min(3, Math.max(1, mVal));
+            x.updatedAt = Date.now();
+            saveStats(t, { immediateCloud: true });
+            forceStats();
+            injectFinishModePicker();
+          }
         };
         const del = el('button', MINI, { type: 'button', textContent: '✕', title: 'Убрать из подсчёта' });
         del.onclick = () => { if (confirm('Убрать эту работу из подсчёта?')) removeRecord(r); };
         row.append(flip, ed, del);
-        w.appendChild(row);
+        worksList.appendChild(row);
       });
+      w.appendChild(worksList);
     }
 
-    // сообщения: считаются сами, плюс ручная поправка
-    const mrow2 = el('div', 'display:flex;gap:6px;align-items:center;justify-content:space-between;font:12px sans-serif;color:#333;margin-top:4px;');
-    mrow2.appendChild(el('span', '', {
-      textContent: '💬 Ответов на сообщения сегодня: ' + P.today.msgs + ' · ' + fmtMoney(P.today.msgs * s.rates.msg)
-    }));
-    const minus = el('button', MINI, { type: 'button', textContent: '−', title: 'Убрать один ответ (если посчитался лишний)' });
-    minus.onclick = () => {
-      const t = loadStats();
-      const last = t.records.filter(r => r.date === dayKey() && r.kind === 'msg').sort((a, b) => b.ts - a.ts)[0];
-      if (!last) return;
-      if ((last.msgs || 1) > 1) last.msgs -= 1;
-      else t.records = t.records.filter(r => r !== last && !(r.id === last.id && r.ts === last.ts));
-      saveStats(t);
-      forceStats();
-    };
-    const plus = el('button', MINI, { type: 'button', textContent: '＋', title: 'Добавить ответ вручную (если не посчитался)' });
-    plus.onclick = () => {
-      const t = loadStats();
-      t.records.push({ kind: 'msg', id: 'manual', date: dayKey(), ts: Date.now(), hw: '(вручную)', msgs: 1 });
-      saveStats(t);
-      forceStats();
-    };
-    mrow2.append(minus, plus);
-    w.appendChild(mrow2);
-
-    const fixBtn = el('button', MINI + 'text-align:left;margin-top:4px;', {
-      type: 'button', textContent: '🛠 Поправить чат за день',
-      title: 'Вручную выставить число сообщений основного чата за выбранную дату'
+    // Облако (Google Таблица, защищено личным секретным кодом методиста)
+    const cloudBox = el('div', 'margin-top:4px;padding:7px 9px;border-radius:10px;display:flex;flex-direction:column;gap:5px;font:12px sans-serif;');
+    cloudBox.className = 'nf-stats-cloud-box';
+    const cloudStatusText = cloudInfo.pendingRestore
+      ? '☁️ Для твоего профиля есть копия в облаке — восстанови по личному коду!'
+      : (cloudInfo.busy ? '☁️ Синхронизация с таблицей…' : (!cloudInfo.hasPin
+        ? '🔐 Облако не подключено (защищено твоим личным кодом)'
+        : (s.lastCloudSyncAt
+          ? '☁️ Облако синхр.: ' + new Date(s.lastCloudSyncAt).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : '☁️ Облако подключено (автосохранение активно)')));
+    cloudBox.appendChild(el('div', 'font:700 11px sans-serif;', { textContent: cloudStatusText }));
+    const cloudBtns = el('div', 'display:flex;gap:6px;flex-wrap:wrap;');
+    const cloudPushBtn = el('button', MINI + 'font-size:11px;padding:4px 8px;font-weight:700;', {
+      type: 'button', textContent: cloudInfo.hasPin ? '☁️ Сохранить в облако' : '🔐 Включить облако',
+      title: 'Сохранить счётчик и период в Google Таблицу под защитой личного кода'
     });
-    fixBtn.onclick = fixChatDay;
-    w.appendChild(fixBtn);
-
-    const csv = el('button', MINI + 'text-align:left;margin-top:4px;', { type: 'button', textContent: '⬇ Выгрузить всё в таблицу (CSV)' });
-    csv.onclick = () => {
-      const st = loadStats();
-      if (!st.records.length) { toast('Пока нечего выгружать', true); return; }
-      downloadCsv(st);
+    cloudPushBtn.onclick = () => {
+      if (typeof nfCloudPushNow === 'function') nfCloudPushNow({ manual: true });
     };
-    w.appendChild(csv);
+    const cloudPullBtn = el('button', MINI + 'font-size:11px;padding:4px 8px;font-weight:700;' + (cloudInfo.pendingRestore ? 'background:#e4f5e8;color:#1b7a43;border-color:#88cca2;' : ''), {
+      type: 'button', textContent: '☁️ Восстановить по коду', title: 'Загрузить твой счётчик и период из облака (требует твой личный код)'
+    });
+    cloudPullBtn.onclick = () => {
+      if (typeof nfCloudMergeRestore === 'function') nfCloudMergeRestore({ manual: true });
+    };
+    cloudBtns.append(cloudPushBtn, cloudPullBtn);
+    cloudBox.appendChild(cloudBtns);
+    w.appendChild(cloudBox);
 
     // Позицию здесь не пересчитываем: при обновлении содержимого панель остаётся
     // ровно там, куда её поставил методист. Перепривязка нужна только при resize.
@@ -2527,17 +2827,24 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     });
   }
 
+  let statsSyncTickBound = false;
   function ensureStatsWidget() {
     // Виджет доступен на всех страницах NeoFamily. Его положение сохраняется между перезагрузками.
     if (!statsWidget || !statsWidget.isConnected) {
       statsWidget = el('div', 'position:fixed;left:12px;bottom:12px;z-index:9999;background:#fff;border:1px solid #f0d9a8;'
         + 'border-radius:14px;padding:8px;display:flex;flex-direction:column;gap:6px;box-shadow:0 5px 18px rgba(0,0,0,.16);'
-        + 'max-width:360px;max-height:72vh;overflow:hidden auto;box-sizing:border-box;');
+        + 'max-width:370px;max-height:74vh;overflow:hidden auto;box-sizing:border-box;');
       statsWidget.className = 'nf-stats-widget';
       statsWidget._month = dayKey().slice(0, 7);
       statsWidget._expanded = loadStatsExpanded();
       document.body.appendChild(statsWidget);
       applyStatsPos(statsWidget);
+    }
+    if (!statsSyncTickBound) {
+      statsSyncTickBound = true;
+      window.addEventListener('focus', () => renderStats(), { passive: true });
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) renderStats(); });
+      setInterval(() => { if (!document.hidden && statsWidget) renderStats(); }, 3000);
     }
     renderStats();
   }
@@ -2548,13 +2855,361 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   }, { passive: true });
 
   // ======================================================================
-  //  ЧАСТЬ 7. Поворот изображений на 90° (кнопка ↻ в углу картинки)
+  //  ЧАСТЬ 7. Улучшение фото ответов учеников: ЧБ-сканер, Контраст, Поворот, Лупа
   // ======================================================================
 
-  function scanRotate(root) {
-    root = root || document;
-    if (root instanceof HTMLImageElement) { addRotateControl(root); return; }
-    if (root.querySelectorAll) root.querySelectorAll('img').forEach(addRotateControl);
+  function nfBuildPhotoFilter(st) {
+    const parts = [];
+    if (st.scanner) {
+      parts.push('grayscale(100%)');
+    }
+    if (st.invert) {
+      parts.push('invert(100%) hue-rotate(180deg)');
+    }
+    // Базовый множитель от ЧБ-сканера + ручной пресет контраста
+    const contrastPresets = [100, 165, 245, 135];
+    const brightPresets = [100, 106, 114, 142];
+    let c = st.customContrast || contrastPresets[st.contrastIdx || 0] || 100;
+    let b = st.customBright || brightPresets[st.contrastIdx || 0] || 100;
+    if (st.scanner && !st.customContrast) {
+      c = Math.round(c * 2.15);
+      b = Math.round(b * 1.10);
+    }
+    if (c !== 100) parts.push('contrast(' + c + '%)');
+    if (b !== 100) parts.push('brightness(' + b + '%)');
+    return parts.join(' ') || 'none';
+  }
+
+  function nfApplyPhotoState(img) {
+    const st = img._nfPhotoState || (img._nfPhotoState = { turns: 0, scanner: false, contrastIdx: 0, invert: false });
+    const turns = ((st.turns % 4) + 4) % 4;
+    img.setAttribute('data-tm-rot', String(turns));
+    img.style.filter = nfBuildPhotoFilter(st);
+    img.style.transition = 'transform .18s ease, filter .15s ease, margin .18s ease';
+
+    const deg = turns * 90;
+    if (turns % 2 === 1) {
+      const w = img.clientWidth || img.naturalWidth || 300;
+      const h = img.clientHeight || img.naturalHeight || 200;
+      const diff = Math.max(0, Math.round((w - h) / 2));
+      img.style.transform = 'rotate(' + deg + 'deg)';
+      img.style.margin = diff + 'px auto';
+    } else {
+      img.style.transform = deg ? ('rotate(' + deg + 'deg)') : '';
+      img.style.margin = '';
+    }
+  }
+
+  function nfOpenPhotoScannerModal(origImg) {
+    document.getElementById('nf-photo-scanner-modal')?.remove();
+    const src = origImg.currentSrc || origImg.src;
+    if (!src) return;
+
+    const baseState = origImg._nfPhotoState || { turns: 0, scanner: false, contrastIdx: 0, invert: false };
+    const st = {
+      turns: baseState.turns || 0,
+      scanner: !!baseState.scanner,
+      contrastIdx: baseState.contrastIdx || 0,
+      invert: !!baseState.invert,
+      customContrast: baseState.scanner ? 225 : ( [100, 165, 245, 135][baseState.contrastIdx || 0] || 100 ),
+      customBright: baseState.scanner ? 112 : ( [100, 106, 114, 142][baseState.contrastIdx || 0] || 100 ),
+      zoom: 1,
+      panX: 0,
+      panY: 0
+    };
+
+    const overlay = document.createElement('div');
+    overlay.id = 'nf-photo-scanner-modal';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(12,10,20,.92);display:flex;flex-direction:column;'
+      + 'user-select:none;font-family:Comfortaa,system-ui,sans-serif;';
+
+    const topBar = document.createElement('div');
+    topBar.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;padding:10px 16px;'
+      + 'background:rgba(28,23,44,.95);border-bottom:1px solid #3d335c;color:#fff;z-index:2;';
+
+    const btnCss = active => 'padding:7px 12px;border-radius:10px;border:1px solid ' + (active ? '#8e74f0' : '#4b3f6e')
+      + ';background:' + (active ? '#6b5cff' : '#2a2240') + ';color:#fff;font:700 12px sans-serif;cursor:pointer;';
+
+    const btnScan = document.createElement('button');
+    btnScan.type = 'button';
+    btnScan.textContent = '🔆 ЧБ-сканер (проявить текст)';
+
+    const btnInv = document.createElement('button');
+    btnInv.type = 'button';
+    btnInv.textContent = '🌗 Инверсия';
+
+    const btnRot = document.createElement('button');
+    btnRot.type = 'button';
+    btnRot.textContent = '↻ Повернуть 90°';
+
+    // Ползунки точной подстройки контраста и яркости
+    const cWrap = document.createElement('label');
+    cWrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;font:600 12px sans-serif;color:#dcd4f0;background:#231c35;padding:5px 10px;border-radius:10px;';
+    const cOut = document.createElement('span');
+    const cRange = document.createElement('input');
+    cRange.type = 'range'; cRange.min = '60'; cRange.max = '380'; cRange.step = '5'; cRange.value = String(st.customContrast);
+    cRange.style.cssText = 'width:95px;accent-color:#6b5cff;cursor:pointer;';
+    cWrap.append('Контраст:', cRange, cOut);
+
+    const bWrap = document.createElement('label');
+    bWrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;font:600 12px sans-serif;color:#dcd4f0;background:#231c35;padding:5px 10px;border-radius:10px;';
+    const bOut = document.createElement('span');
+    const bRange = document.createElement('input');
+    bRange.type = 'range'; bRange.min = '60'; bRange.max = '240'; bRange.step = '5'; bRange.value = String(st.customBright);
+    bRange.style.cssText = 'width:85px;accent-color:#6b5cff;cursor:pointer;';
+    bWrap.append('Яркость:', bRange, bOut);
+
+    const btnReset = document.createElement('button');
+    btnReset.type = 'button';
+    btnReset.textContent = 'Сброс';
+    btnReset.style.cssText = btnCss(false);
+
+    const btnClose = document.createElement('button');
+    btnClose.type = 'button';
+    btnClose.textContent = '✕ Закрыть (Esc)';
+    btnClose.style.cssText = 'padding:7px 14px;border-radius:10px;border:0;background:#d9386a;color:#fff;font:800 12px sans-serif;cursor:pointer;margin-left:8px;';
+
+    const stage = document.createElement('div');
+    stage.style.cssText = 'flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;cursor:grab;';
+
+    const bigImg = document.createElement('img');
+    bigImg.src = src;
+    bigImg.draggable = false;
+    bigImg.style.cssText = 'max-width:92vw;max-height:82vh;object-fit:contain;border-radius:8px;transform-origin:center center;will-change:transform,filter;';
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'position:absolute;bottom:12px;left:50%;transform:translateX(-50%);padding:6px 14px;border-radius:99px;'
+      + 'background:rgba(20,16,34,.8);color:#cbc2e3;font:600 12px sans-serif;pointer-events:none;';
+
+    function syncModal() {
+      btnScan.style.cssText = btnCss(st.scanner);
+      btnInv.style.cssText = btnCss(st.invert);
+      btnRot.style.cssText = btnCss(st.turns % 4 !== 0);
+      cRange.value = String(st.customContrast);
+      bRange.value = String(st.customBright);
+      cOut.textContent = st.customContrast + '%';
+      bOut.textContent = st.customBright + '%';
+      bigImg.style.filter = nfBuildPhotoFilter(st);
+      const deg = ((st.turns % 4) + 4) % 4 * 90;
+      bigImg.style.transform = `translate(${st.panX}px, ${st.panY}px) scale(${st.zoom}) rotate(${deg}deg)`;
+      hint.textContent = `Колёсико мыши: зум (${Math.round(st.zoom * 100)}%) · Зажми ЛКМ: двигать фото · Двойной клик: сбросить зум`;
+    }
+
+    btnScan.onclick = () => {
+      st.scanner = !st.scanner;
+      if (st.scanner) {
+        st.customContrast = Math.max(st.customContrast, 235);
+        st.customBright = Math.max(st.customBright, 112);
+      } else {
+        st.customContrast = 100;
+        st.customBright = 100;
+      }
+      origImg._nfPhotoState = { ...origImg._nfPhotoState, scanner: st.scanner, turns: st.turns, invert: st.invert };
+      nfApplyPhotoState(origImg);
+      origImg._nfSyncToolbar?.();
+      syncModal();
+    };
+
+    btnInv.onclick = () => {
+      st.invert = !st.invert;
+      origImg._nfPhotoState = { ...origImg._nfPhotoState, invert: st.invert };
+      nfApplyPhotoState(origImg);
+      origImg._nfSyncToolbar?.();
+      syncModal();
+    };
+
+    btnRot.onclick = () => {
+      st.turns = (st.turns + 1) % 4;
+      origImg._nfPhotoState = { ...origImg._nfPhotoState, turns: st.turns };
+      nfApplyPhotoState(origImg);
+      origImg._nfSyncToolbar?.();
+      syncModal();
+    };
+
+    cRange.oninput = () => { st.customContrast = Number(cRange.value); syncModal(); };
+    bRange.oninput = () => { st.customBright = Number(bRange.value); syncModal(); };
+
+    btnReset.onclick = () => {
+      st.scanner = false; st.invert = false; st.turns = 0;
+      st.customContrast = 100; st.customBright = 100;
+      st.zoom = 1; st.panX = 0; st.panY = 0;
+      origImg._nfPhotoState = { turns: 0, scanner: false, contrastIdx: 0, invert: false };
+      nfApplyPhotoState(origImg);
+      origImg._nfSyncToolbar?.();
+      syncModal();
+    };
+
+    stage.addEventListener('wheel', e => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.18 : (1 / 1.18);
+      st.zoom = Math.min(6.5, Math.max(0.5, Math.round(st.zoom * factor * 100) / 100));
+      syncModal();
+    }, { passive: false });
+
+    stage.addEventListener('dblclick', () => {
+      st.zoom = st.zoom > 1.2 ? 1 : 2.2;
+      st.panX = 0; st.panY = 0;
+      syncModal();
+    });
+
+    let dragging = false, sx = 0, sy = 0, spx = 0, spy = 0;
+    stage.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return;
+      dragging = true;
+      sx = e.clientX; sy = e.clientY;
+      spx = st.panX; spy = st.panY;
+      stage.style.cursor = 'grabbing';
+      stage.setPointerCapture?.(e.pointerId);
+    });
+    stage.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      st.panX = spx + (e.clientX - sx);
+      st.panY = spy + (e.clientY - sy);
+      syncModal();
+    });
+    const endDrag = e => {
+      if (!dragging) return;
+      dragging = false;
+      stage.style.cursor = 'grab';
+      stage.releasePointerCapture?.(e.pointerId);
+    };
+    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointercancel', endDrag);
+
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey, true);
+    };
+    const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    document.addEventListener('keydown', onKey, true);
+    btnClose.onclick = close;
+
+    topBar.append(btnScan, cWrap, bWrap, btnInv, btnRot, btnReset, btnClose);
+    stage.append(bigImg, hint);
+    overlay.append(topBar, stage);
+    document.body.appendChild(overlay);
+    syncModal();
+  }
+
+  function addRotateControl(img) {
+    if (!img || !(img instanceof HTMLImageElement) || img.dataset.nfPhotoEnhanced === '1') return;
+    if (img.closest('.nf-tpl-panel, .nf-attach-preview, #nf-remote-popup, #nf-admin-console, #nf-photo-scanner-modal')) return;
+
+    img.dataset.nfPhotoEnhanced = '1';
+    const st = img._nfPhotoState || (img._nfPhotoState = { turns: 0, scanner: false, contrastIdx: 0, invert: false });
+
+    const bar = document.createElement('div');
+    bar.className = 'nf-photo-tools';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;'
+      + 'padding:5px 8px;border-radius:11px;background:#f5f2ff;border:1px solid #dcd3f7;width:fit-content;max-width:100%;';
+
+    const chipStyle = (active, accent = '#6b5cff') =>
+      'padding:5px 10px;border-radius:8px;border:1px solid ' + (active ? accent : '#ccc4e3')
+      + ';background:' + (active ? accent : '#fff') + ';color:' + (active ? '#fff' : '#32294a')
+      + ';font:700 12px/1.2 Nunito,system-ui,sans-serif;cursor:pointer;transition:all .12s;';
+
+    const bScan = document.createElement('button');
+    bScan.type = 'button';
+    bScan.title = 'Превратить фото тетради в чёткий чёрно-белый скан (проявить бледный карандаш или ручку)';
+
+    const bContrast = document.createElement('button');
+    bContrast.type = 'button';
+    bContrast.title = 'Переключить усиление контраста и яркости (3 режима)';
+
+    const bInvert = document.createElement('button');
+    bInvert.type = 'button';
+    bInvert.textContent = '🌗 Инверсия';
+    bInvert.title = 'Инвертировать цвета (удобно при сильном засвете)';
+
+    const bRot = document.createElement('button');
+    bRot.type = 'button';
+    bRot.textContent = '↻ 90°';
+    bRot.title = 'Повернуть фотографию на 90° по часовой стрелке';
+
+    const bZoom = document.createElement('button');
+    bZoom.type = 'button';
+    bZoom.textContent = '🔍 Лупа + Слайдеры';
+    bZoom.title = 'Открыть фото во весь экран с зумом до 600% и точной настройкой контраста';
+    bZoom.style.cssText = chipStyle(false, '#2e7d6b');
+
+    const contrastLabels = ['☀️ Вытянуть контраст', '☀️ Контраст ×1.6', '☀️ Контраст МАКС ×2.5', '☀️ Высветлить +40%'];
+
+    function syncBar() {
+      bScan.textContent = st.scanner ? '🔆 ЧБ-сканер: ВКЛ' : '🔆 ЧБ-сканер';
+      bScan.style.cssText = chipStyle(st.scanner, '#6b5cff');
+
+      bContrast.textContent = contrastLabels[st.contrastIdx] || contrastLabels[0];
+      bContrast.style.cssText = chipStyle(st.contrastIdx > 0, '#d97706');
+
+      bInvert.style.cssText = chipStyle(st.invert, '#4a3f68');
+      bRot.style.cssText = chipStyle((st.turns % 4) !== 0, '#1a73e8');
+    }
+    img._nfSyncToolbar = syncBar;
+
+    bScan.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      st.scanner = !st.scanner;
+      nfApplyPhotoState(img);
+      syncBar();
+    };
+
+    bContrast.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      st.contrastIdx = ((st.contrastIdx || 0) + 1) % 4;
+      nfApplyPhotoState(img);
+      syncBar();
+    };
+
+    bInvert.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      st.invert = !st.invert;
+      nfApplyPhotoState(img);
+      syncBar();
+    };
+
+    bRot.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      st.turns = ((st.turns || 0) + 1) % 4;
+      nfApplyPhotoState(img);
+      syncBar();
+    };
+
+    bZoom.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      nfOpenPhotoScannerModal(img);
+    };
+
+    syncBar();
+    bar.append(bScan, bContrast, bInvert, bRot, bZoom);
+    if (img.parentElement) {
+      img.parentElement.insertBefore(bar, img);
+    }
+  }
+
+  function scanRotate() {
+    // 1) Все фотографии в блоке «Ответ ученика» внутри карточек заданий
+    document.querySelectorAll('[data-task-id]').forEach(card => {
+      const region = card.querySelector('[role="region"]');
+      if (!region) return;
+      const answerLabel = [...region.querySelectorAll('span')]
+        .find(s => /Ответ ученика/i.test(s.textContent));
+      if (!answerLabel) return;
+      let ans = answerLabel;
+      const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы (ключа|ответа)/i.test(d.textContent));
+      if (keyBox) {
+        while (ans.parentElement && !ans.parentElement.contains(keyBox)) ans = ans.parentElement;
+      } else if (answerLabel.parentElement) {
+        ans = answerLabel.parentElement;
+      }
+      ans.querySelectorAll('img').forEach(addRotateControl);
+    });
+
+    // 2) Крупные фотографии, присланные учеником в диалоге к домашке
+    document.querySelectorAll('[id$="-dialogue"] img').forEach(img => {
+      if (img.closest('.nf-tpl-panel, .nf-attach-preview')) return;
+      if ((img.naturalWidth && img.naturalWidth < 90) || (img.width && img.width < 70)) return;
+      addRotateControl(img);
+    });
   }
 
   // ======================================================================
@@ -2574,8 +3229,14 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const now = Date.now();
     const dt = createdAt && !Number.isNaN(Date.parse(createdAt)) ? new Date(createdAt) : new Date();
     const st = loadStats();
+    const recId = 'chat:' + unique;
+    if (st.records.some(r => String(r.id) === recId)) {
+      seen[unique] = now;
+      jsonSave(CHAT_SEEN_KEY, seen);
+      return;
+    }
     // Сохраняем ID вместо текста переписки. Статистика не включает сообщения других людей.
-    st.records.push({ kind: 'chat_msg', id: 'chat:' + unique, date: dayKey(dt),
+    st.records.push({ kind: 'chat_msg', id: recId, date: dayKey(dt),
       ts: now, hw: '(основной чат)', chatMsgs: 1 });
     if (!saveStats(st)) return;
     seen[unique] = now;
@@ -2667,6 +3328,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   const SHIFT_SOURCE_STORE = 'nf_shift_source_v1';
   const SHIFT_HISTORY_STORE = 'nf_shift_history_v1';
   const SHIFT_METHODIST_STORE = 'nf_methodist_full_name_v1';
+  const SHIFT_VIEW_METHODIST_STORE = 'nf_shift_view_name_v1';
   const SHIFT_GOOGLE_URL = 'https://script.google.com/macros/s/AKfycbxoDoEXXu9e2-J5l00ZJ1Ibc1VhTXGNlBGs69ljlYcprXVCLHrznUpOu8DJh_fzIbot/exec';
   const SHIFT_GOOGLE_KEY = 'NEOCHECK_BIO_2026';
   const SHIFT_GOOGLE_TTL = 5 * 60 * 1000;
@@ -2772,11 +3434,41 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       else localStorage.setItem(SHIFT_METHODIST_STORE, n);
     } catch (e) {}
   }
+  function shiftGetViewName() {
+    try {
+      const x = typeof GM_getValue === 'function' ? GM_getValue(SHIFT_VIEW_METHODIST_STORE, '') : localStorage.getItem(SHIFT_VIEW_METHODIST_STORE);
+      return String(x || '').trim();
+    } catch (e) { return ''; }
+  }
+  function shiftSaveViewName(name) {
+    const n = String(name || '').trim();
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(SHIFT_VIEW_METHODIST_STORE, n);
+      else localStorage.setItem(SHIFT_VIEW_METHODIST_STORE, n);
+    } catch (e) {}
+  }
   function shiftDetectMethodistName() {
     const first = shiftSidebarFirstName();
     const cached = shiftCachedMethodistName();
-    if (cached && (!first || cached.toLocaleLowerCase('ru-RU').startsWith(first.toLocaleLowerCase('ru-RU') + ' '))) return cached;
+    const matchesFirst = full => !first || full.toLocaleLowerCase('ru-RU').startsWith(first.toLocaleLowerCase('ru-RU') + ' ');
+    if (cached && cached.split(/\s+/).length >= 2 && matchesFirst(cached)) return cached;
 
+    // 1) Приоритетно проверяем собственные сообщения авторизованного пользователя [data-current-user="true"]
+    const ownCandidates = new Set();
+    document.querySelectorAll('[data-current-user="true"] span, [data-current-user="true"] div').forEach(el => {
+      if (el.children.length) return;
+      const raw = (el.textContent || '').trim();
+      if (raw.length > 90 || !/^(Методист|Куратор|Администратор|Преподаватель|Модератор)\s+/i.test(raw)) return;
+      const n = shiftCleanStaffName(raw);
+      if (n && n.split(/\s+/).length >= 2 && matchesFirst(n)) ownCandidates.add(n);
+    });
+    if (ownCandidates.size === 1) {
+      const n = [...ownCandidates][0];
+      shiftSaveMethodistName(n);
+      return n;
+    }
+
+    // 2) Запасной поиск по странице строго с фильтром по имени из левого меню сайта
     const candidates = new Set();
     document.querySelectorAll('span').forEach(el => {
       if (el.children.length) return;
@@ -2784,7 +3476,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       if (raw.length > 90 || !/^(Методист|Куратор|Администратор|Преподаватель|Модератор)\s+/i.test(raw)) return;
       const n = shiftCleanStaffName(raw);
       if (!n || n.split(/\s+/).length < 2) return;
-      if (!first || n.toLocaleLowerCase('ru-RU').startsWith(first.toLocaleLowerCase('ru-RU') + ' ')) candidates.add(n);
+      if (matchesFirst(n)) candidates.add(n);
     });
     if (candidates.size === 1) {
       const n = [...candidates][0];
@@ -2795,12 +3487,12 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   }
   function shiftAskMethodistName() {
     const first = shiftSidebarFirstName();
-    const old = shiftCachedMethodistName();
-    const entered = prompt('Не удалось однозначно определить ФИО методиста.\nУкажи имя и фамилию один раз — NeoCheck запомнит их для Google-расписания.', old || (first ? first + ' ' : ''));
+    const old = shiftGetViewName() || shiftCachedMethodistName();
+    const entered = prompt('Укажи имя и фамилию (или фамилию) для просмотра расписания из Google:', old || (first ? first + ' ' : ''));
     if (entered === null) return '';
     const n = String(entered).replace(/\s+/g,' ').trim();
-    if (n.split(/\s+/).length < 2) { toast('Нужно указать имя и фамилию', true); return ''; }
-    shiftSaveMethodistName(n);
+    if (!n) { toast('Укажи фамилию или имя и фамилию', true); return ''; }
+    shiftSaveViewName(n);
     return n;
   }
 
@@ -2852,7 +3544,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   async function shiftSyncGoogle(opts = {}) {
     if (shiftGoogleBusy) return;
     const manual = !!opts.manual;
-    let name = shiftDetectMethodistName();
+    let name = opts.name || shiftGetViewName() || shiftDetectMethodistName();
     if (!name && manual) name = shiftAskMethodistName();
     if (!name) {
       shiftGoogleLastError = 'ФИО не определено';
@@ -2893,7 +3585,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     if (shiftWeekIsCleared(week)) return;
     const w = shiftGoogleRead()?.weeks?.[week];
     if (w?.ok && Date.now() - Number(w.syncedAt || 0) < SHIFT_GOOGLE_TTL) return;
-    if (!shiftDetectMethodistName()) return;
+    if (!shiftGetViewName() && !shiftDetectMethodistName()) return;
     shiftSyncGoogle({manual:false});
   }
   function shiftGoogleCount(week) {
@@ -3348,7 +4040,8 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       shiftRender(); shiftRefreshLabel();
     }));
     actions.appendChild(shiftBtn('👤 ФИО', () => {
-      if (shiftAskMethodistName()) shiftSyncGoogle({manual:true});
+      const picked = shiftAskMethodistName();
+      if (picked) shiftSyncGoogle({manual:true, name:picked});
     }));
     actions.appendChild(shiftBtn('📋 Скопировать предыдущую неделю', () => {
       if (!confirm('Заменить расписание этой недели сменами предыдущей?')) return;
@@ -3874,7 +4567,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     'nf_view_prefs_v1', 'nf_work_stats_v2', 'nf_work_stats_v1',
     'nf_seen_answers_v1', 'nf_msg_base_v1', 'nf_main_chat_sent_ids_v1',
     'nf_my_shifts_v1', 'nf_my_shift_windows_v1',
-    'nf_nc_gas_cfg_v1', 'nf_methodist_full_name_v1', 'nf_remote_admin_secret_v1'
+    'nf_nc_gas_cfg_v1', 'nf_methodist_full_name_v1'
   ];
   const NF_BACKUP_MAGIC = 'neocheck-backup';
   function nfBackupGet(key) {
@@ -3983,7 +4676,31 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     const close=button('Закрыть');close.style.background='#fff';
     const shut=()=>overlay.remove();close.onclick=shut;
     overlay.addEventListener('mousedown',e=>{if(e.target===overlay)shut();});
-    panel.append(title,desc,save,restore,file,status,note,close);
+
+    const cloudRestoreBtn = button('☁️ Восстановить счётчик и период из облака');
+    cloudRestoreBtn.style.background = '#e8f5ee';
+    cloudRestoreBtn.style.borderColor = '#8cc7a6';
+    cloudRestoreBtn.style.color = '#1b6840';
+    cloudRestoreBtn.onclick = async () => {
+      cloudRestoreBtn.disabled = true;
+      status.textContent = '⏳ Ищем сохранённый счётчик в Google Таблице…';
+      try {
+        const res = typeof nfCloudMergeRestore === 'function'
+          ? await nfCloudMergeRestore({ manual: true })
+          : null;
+        if (res && res.ok) {
+          status.textContent = '✅ Счётчик восстановлен (' + (res.mergedCount || 0) + ' записей, период с ' + fmtDateRu(res.payoutFrom) + ')!';
+        } else {
+          status.textContent = (res && res.message) || 'Не удалось найти сохранённую копию в облаке.';
+        }
+      } catch (e) {
+        status.textContent = '❌ Ошибка облака: ' + e.message;
+      } finally {
+        cloudRestoreBtn.disabled = false;
+      }
+    };
+
+    panel.append(title,desc,save,restore,cloudRestoreBtn,file,status,note,close);
     overlay.appendChild(panel);document.body.appendChild(overlay);
   }
   function nfBackupInject() {
@@ -4753,16 +5470,16 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) nfChatLocksInject(); });
 
   // ======================================================================
-  //  ЧАСТЬ 13. Дистанционный пульт отправки на экран + Звуки + Контроль прочтения
+  //  ЧАСТЬ 13. Приём уведомлений с экрана + Облачное сохранение счётчика
   // ======================================================================
   const NF_REMOTE_SEEN_KEY = 'nf_remote_seen_msg_v1';
-  const NF_REMOTE_ADMIN_KEY = 'nf_remote_admin_secret_v1';
   const NF_REMOTE_POLL_MS = 15 * 1000;
   let nfRemotePendingMsg = null;
   let nfRemoteShownReportedId = '';
 
   function nfRemoteMyName() {
-    return shiftDetectMethodistName() || shiftCachedMethodistName() || '';
+    // Строго подтверждённое ФИО авторизованного пользователя (никогда не подменяется чужим из «Мои смены»)
+    return shiftDetectMethodistName() || '';
   }
 
   function nfRemotePost(payload) {
@@ -4776,7 +5493,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         url: SHIFT_GOOGLE_URL,
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         data: JSON.stringify({ key: SHIFT_GOOGLE_KEY, ...payload }),
-        timeout: 15000,
+        timeout: 20000,
         onload: r => {
           try {
             resolve(JSON.parse(r.responseText || '{}'));
@@ -4788,6 +5505,388 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
         ontimeout: () => reject(new Error('Таймаут'))
       });
     });
+  }
+
+  // --- Облачное сохранение и восстановление счётчика (Google Таблица, строго по подтверждённому профилю + личному коду) ---
+  const NF_CLOUD_PIN_KEY = 'nf_cloud_pin_token_v1';
+  const nfCloudState = {
+    busy: false,
+    pendingRestore: false,
+    checkedStartup: false,
+    pushTimer: null
+  };
+
+  function nfCloudGetPinObj() {
+    const obj = jsonLoad(NF_CLOUD_PIN_KEY, null);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  }
+
+  function nfCloudGetPinToken(name) {
+    const obj = nfCloudGetPinObj();
+    if (!obj || !obj.token || !name) return '';
+    const norm = String(name).toLocaleLowerCase('ru-RU').replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+    return obj.name === norm ? String(obj.token) : '';
+  }
+
+  function nfCloudSavePinToken(name, token) {
+    const norm = String(name || '').toLocaleLowerCase('ru-RU').replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+    if (!norm || !token) return;
+    jsonSave(NF_CLOUD_PIN_KEY, { name: norm, token: String(token) });
+  }
+
+  function nfCloudClearPinToken() {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(NF_CLOUD_PIN_KEY, '');
+      else localStorage.removeItem(NF_CLOUD_PIN_KEY);
+    } catch (_) {}
+  }
+
+  function nfCloudStatusInfo() {
+    const myName = nfRemoteMyName();
+    return {
+      busy: nfCloudState.busy,
+      pendingRestore: nfCloudState.pendingRestore,
+      hasPin: !!nfCloudGetPinToken(myName)
+    };
+  }
+
+  async function nfCloudHashPin(name, rawPin) {
+    const norm = String(name || '').toLocaleLowerCase('ru-RU').replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+    const input = 'NF_CLOUD_CLIENT_2026|' + norm + '|' + String(rawPin || '');
+    if (typeof crypto !== 'undefined' && crypto.subtle && typeof TextEncoder !== 'undefined') {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    // Резервный детерминированный SHA-256-совместимый многораундовый хеш (если crypto.subtle отключён)
+    let h1 = 0x811c9dc5, h2 = 0x9e3779b9, h3 = 0x85ebca6b, h4 = 0xc2b2ae35;
+    for (let i = 0; i < input.length; i++) {
+      const c = input.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 + c + i, 0x85ebca6b) >>> 0;
+      h3 = Math.imul(h3 ^ (c << (i % 7)), 0xc2b2ae35) >>> 0;
+      h4 = Math.imul(h4 + (h1 ^ h2), 0x27d4eb2f) >>> 0;
+    }
+    return [h1, h2, h3, h4].map(x => x.toString(16).padStart(8, '0')).join('');
+  }
+
+  function nfCloudPromptPinModal(mode, profileName) {
+    return new Promise(resolve => {
+      document.getElementById('nf-cloud-pin-modal')?.remove();
+      const cover = el('div', 'position:fixed;inset:0;z-index:2147483645;background:rgba(24,20,39,.65);display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;');
+      cover.id = 'nf-cloud-pin-modal';
+
+      const box = el('div', 'width:min(410px,95vw);background:#fff;color:#2c2538;border-radius:18px;padding:20px;box-shadow:0 18px 55px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:11px;font:13px/1.45 sans-serif;');
+      const isRestore = mode === 'restore';
+      box.appendChild(el('div', 'font:800 17px Comfortaa,sans-serif;color:#2c2538;', {
+        textContent: isRestore ? '🔐 Восстановление из облака' : '🔐 Личный код облака'
+      }));
+
+      const profBadge = el('div', 'padding:8px 10px;border-radius:10px;background:#f4effc;border:1px solid #d5c7ef;color:#3d2f63;font:700 12px sans-serif;', {
+        textContent: '👤 Подтверждённый профиль: ' + profileName
+      });
+      box.appendChild(profBadge);
+
+      box.appendChild(el('div', 'font-size:12px;color:#5f5670;', {
+        textContent: isRestore
+          ? 'Введи свой личный секретный код (ПИН), который ты задавал(а) при подключении облака. Загрузить данные другого человека невозможно.'
+          : 'Придумай короткий личный код (от 4 символов). Он защитит твой счётчик от доступа или перезаписи посторонними и понадобится, только если переустановишь скрипт.'
+      }));
+
+      const pinIn = el('input', 'padding:10px 12px;border-radius:10px;border:1px solid #cbbce8;font:700 14px sans-serif;color:#222;background:#faf8ff;', {
+        type: 'password',
+        placeholder: isRestore ? 'Твой личный код (ПИН)' : 'Придумай код (минимум 4 символа)',
+        autocomplete: 'current-password'
+      });
+      const errLine = el('div', 'font:700 12px sans-serif;color:#b83f53;min-height:16px;');
+      const btns = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
+      const cancel = el('button', MINI, { type: 'button', textContent: 'Отмена' });
+      const ok = el('button', 'padding:8px 16px;border-radius:10px;border:0;background:#2e7d6b;color:#fff;font:700 13px sans-serif;cursor:pointer;', {
+        type: 'button', textContent: isRestore ? '☁️ Восстановить' : '🔐 Подключить и сохранить'
+      });
+
+      const done = val => { cover.remove(); resolve(val); };
+      cancel.onclick = () => done(null);
+      cover.addEventListener('mousedown', e => { if (e.target === cover) done(null); });
+
+      const submit = async () => {
+        const val = pinIn.value.trim();
+        if (val.length < 4) {
+          errLine.textContent = 'Код должен быть не короче 4 символов';
+          pinIn.focus();
+          return;
+        }
+        ok.disabled = true;
+        const token = await nfCloudHashPin(profileName, val);
+        done(token);
+      };
+      ok.onclick = submit;
+      pinIn.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+
+      btns.append(cancel, ok);
+      box.append(pinIn, errLine, btns);
+      cover.appendChild(box);
+      document.body.appendChild(cover);
+      setTimeout(() => pinIn.focus(), 40);
+    });
+  }
+
+  function nfCloudSchedulePush(delayMs = 4000) {
+    clearTimeout(nfCloudState.pushTimer);
+    nfCloudState.pushTimer = setTimeout(() => {
+      nfCloudPushNow({ manual: false });
+    }, delayMs);
+  }
+
+  async function nfCloudPushNow({ manual = false, forceOverwrite = false } = {}) {
+    if (nfCloudState.busy) return null;
+    const name = nfRemoteMyName();
+    if (!name) {
+      if (manual) {
+        const first = shiftSidebarFirstName();
+        toast(first
+          ? 'Открой любую свою проверенную работу или чат (где есть твоё сообщение), чтобы автоматически подтвердить профиль «' + first + '»'
+          : 'Открой раздел «Домашние работы» или чат на Neofamily для определения твоего профиля', true);
+      }
+      return null;
+    }
+
+    let pinToken = nfCloudGetPinToken(name);
+    if (!pinToken) {
+      if (!manual) return null; // Фоново не отправляем, пока методист сам не подключил защиту личным кодом
+      pinToken = await nfCloudPromptPinModal('setup', name);
+      if (!pinToken) return null;
+    }
+
+    const s = loadStats();
+    // Пустой несинхронизированный скрипт никогда не пытается затереть облако
+    if (!manual && !forceOverwrite && s.records.length === 0 && !s.cloudKnownRev) {
+      return null;
+    }
+
+    nfCloudState.busy = true;
+    if (manual) forceStats();
+    try {
+      const P = periodStats(s.records, s);
+      const compactRecords = s.records.map(r => {
+        const item = {
+          kind: r.kind || 'work',
+          id: r.id,
+          date: r.date,
+          ts: r.ts,
+          hw: r.hw ? String(r.hw).slice(0, 90) : '',
+          neuro: Number(r.neuro) || 0,
+          regular: Number(r.regular) || 0,
+          msgs: Number(r.msgs) || 0,
+          chatMsgs: Number(r.chatMsgs) || 0
+        };
+        if (r.mode) item.mode = r.mode;
+        if (r.src) item.src = r.src;
+        if (r.updatedAt) item.updatedAt = r.updatedAt;
+        if (r.multiplier !== undefined && Number(r.multiplier) !== 1) item.multiplier = Number(r.multiplier);
+        if (Array.isArray(r.taskIds) && r.taskIds.length) item.taskIds = r.taskIds;
+        return item;
+      });
+
+      const res = await nfRemotePost({
+        action: 'save_stats_cloud',
+        name,
+        pinToken,
+        version: NF_SCRIPT_VERSION,
+        clientKnownRev: Number(s.cloudKnownRev) || 0,
+        forceOverwrite: !!forceOverwrite,
+        summary: {
+          tasksSummary: P.payout.works + ' работ / ' + (P.payout.neuro + P.payout.regular) + ' зад. (🤖' + P.payout.neuro + ' ✍' + P.payout.regular + ')',
+          msgsSummary: 'ДЗ: ' + P.payout.msgs + ' · Чат: ' + P.payout.chatMsgs,
+          payoutMoney: Math.round(P.payout.money * 100) / 100
+        },
+        stats: {
+          records: compactRecords,
+          tiers: s.tiers,
+          rates: s.rates,
+          mode: s.mode,
+          taskComments: !!s.taskComments,
+          payoutFrom: s.payoutFrom,
+          payoutTo: s.payoutTo,
+          payoutResetTs: s.payoutResetTs,
+          rev: s.rev
+        }
+      });
+
+      if (res && res.ok) {
+        nfCloudSavePinToken(name, pinToken);
+        const fresh = loadStats();
+        fresh.cloudKnownRev = Number(res.rev) || fresh.cloudKnownRev;
+        fresh.lastCloudSyncAt = Date.now();
+        jsonSave(STAT_KEY, fresh);
+        nfCloudState.pendingRestore = false;
+        if (manual) toast('☁️ Статистика и период сохранены в облако (' + (res.recordsCount || 0) + ' зап.)');
+        return res;
+      }
+
+      if (res && res.error === 'bad_pin') {
+        nfCloudClearPinToken();
+        if (manual) toast('❌ Неверный личный код облака для профиля «' + name + '»!', true);
+        return res;
+      }
+      if (res && res.error === 'pin_locked') {
+        if (manual) toast('⏳ Слишком много неверных попыток. Попробуй через 10 минут.', true);
+        return res;
+      }
+
+      if (res && (res.error === 'cloud_has_data' || res.error === 'cloud_conflict')) {
+        nfCloudSavePinToken(name, pinToken);
+        nfCloudState.pendingRestore = true;
+        if (manual) {
+          const m = res.cloudMeta || {};
+          const wantMerge = confirm(
+            'В облаке уже есть твоя сохранённая статистика (' + name + '):\n'
+            + '• Записей: ' + (m.recordsCount || 0) + '\n'
+            + '• Период: с ' + fmtDateRu(m.payoutFrom || '') + '\n'
+            + '• Выплата: ' + fmtMoney(m.payoutMoney || 0) + '\n'
+            + '• Сохранено: ' + (m.updatedAtMsk || 'ранее') + '\n\n'
+            + 'Нажми «ОК», чтобы ВОССТАНОВИТЬ и ОБЪЕДИНИТЬ её с текущими записями (рекомендуется).\n'
+            + 'Нажми «Отмена», чтобы оставить облако нетронутым.'
+          );
+          if (wantMerge) {
+            nfCloudState.busy = false;
+            return await nfCloudMergeRestore({ manual: true });
+          }
+          const wantOverwrite = confirm('Хочешь ПРИНУДИТЕЛЬНО перезаписать облако твоими текущими локальными данными (' + s.records.length + ' зап.)?');
+          if (wantOverwrite) {
+            nfCloudState.busy = false;
+            return await nfCloudPushNow({ manual: true, forceOverwrite: true });
+          }
+        }
+        return res;
+      }
+
+      if (manual) toast('☁️ Ошибка облака: ' + (res?.error || 'неизвестно'), true);
+      return res;
+    } catch (e) {
+      if (manual) toast('☁️ Ошибка соединения с облаком: ' + e.message, true);
+      return null;
+    } finally {
+      nfCloudState.busy = false;
+      forceStats();
+    }
+  }
+
+  async function nfCloudMergeRestore({ manual = false } = {}) {
+    if (nfCloudState.busy) return { ok: false, message: 'Синхронизация уже выполняется…' };
+    const name = nfRemoteMyName();
+    if (!name) {
+      const first = shiftSidebarFirstName();
+      const msg = first
+        ? 'Открой любую свою проверенную работу или чат (где есть твоё сообщение), чтобы автоматически подтвердить профиль «' + first + '»'
+        : 'Открой «Домашние работы» или чат на Neofamily для автоопределения твоего профиля';
+      if (manual) toast(msg, true);
+      return { ok: false, message: msg };
+    }
+
+    let pinToken = nfCloudGetPinToken(name);
+    if (!pinToken) {
+      if (!manual) return { ok: false, message: 'Требуется личный код' };
+      pinToken = await nfCloudPromptPinModal('restore', name);
+      if (!pinToken) return { ok: false, message: 'Отменено пользователем' };
+    }
+
+    nfCloudState.busy = true;
+    forceStats();
+    try {
+      const res = await nfRemotePost({ action: 'load_stats_cloud', name, pinToken });
+      if (res && res.error === 'bad_pin') {
+        nfCloudClearPinToken();
+        if (manual) toast('❌ Неверный личный код облака для «' + name + '»!', true);
+        return { ok: false, message: 'Неверный личный код' };
+      }
+      if (res && res.error === 'pin_locked') {
+        if (manual) toast('⏳ Слишком много неверных попыток. Подожди 10 минут.', true);
+        return { ok: false, message: 'Слишком много неверных попыток' };
+      }
+      if (!res || !res.ok || !res.exists || !res.stats) {
+        if (manual) toast('Для профиля «' + name + '» в облаке пока нет сохранённой копии', true);
+        return { ok: false, message: 'Копия для «' + name + '» не найдена' };
+      }
+
+      nfCloudSavePinToken(name, pinToken);
+      const cloud = res.stats;
+      const local = loadStats();
+      const cloudRecords = Array.isArray(cloud.records) ? cloud.records : [];
+      const localHadRecords = local.records.length > 0;
+      const mergedRecords = normalizeRecordList(cloudRecords.concat(local.records));
+
+      const takeCloudPeriod = !localHadRecords || (Number(cloud.rev || 0) >= Number(local.rev || 0));
+      const merged = {
+        ...local,
+        records: mergedRecords,
+        tiers: takeCloudPeriod ? { ...(local.tiers || {}), ...(cloud.tiers || {}) } : { ...(cloud.tiers || {}), ...(local.tiers || {}) },
+        rates: takeCloudPeriod && cloud.rates ? { ...local.rates, ...cloud.rates } : local.rates,
+        mode: takeCloudPeriod && cloud.mode ? cloud.mode : local.mode,
+        taskComments: takeCloudPeriod && cloud.taskComments !== undefined ? !!cloud.taskComments : local.taskComments,
+        payoutFrom: takeCloudPeriod && /^\d{4}-\d{2}-\d{2}$/.test(String(cloud.payoutFrom || '')) ? cloud.payoutFrom : local.payoutFrom,
+        payoutTo: takeCloudPeriod && cloud.payoutTo !== undefined ? (cloud.payoutTo || '') : local.payoutTo,
+        payoutResetTs: takeCloudPeriod ? (Number(cloud.payoutResetTs) || 0) : local.payoutResetTs,
+        cloudKnownRev: Number(res.meta?.rev || cloud.rev || 0),
+        lastCloudSyncAt: Date.now()
+      };
+
+      saveStats(merged, { skipCloud: true });
+      nfCloudState.pendingRestore = false;
+
+      // Обновляем кеш отправленных сообщений чата, чтобы восстановленные записи никогда не задвоились
+      const seenChat = jsonLoad(CHAT_SEEN_KEY, {});
+      let chatDirty = false;
+      for (const rec of mergedRecords) {
+        if (rec.kind === 'chat_msg' && String(rec.id || '').startsWith('chat:')) {
+          const u = String(rec.id).slice(5);
+          if (!seenChat[u]) { seenChat[u] = Number(rec.ts) || Date.now(); chatDirty = true; }
+        }
+      }
+      if (chatDirty) jsonSave(CHAT_SEEN_KEY, seenChat);
+
+      if (manual) {
+        toast('✅ Восстановлено из облака: ' + mergedRecords.length + ' зап. (период с ' + fmtDateRu(merged.payoutFrom) + ')');
+      }
+
+      const shouldPushMerged = mergedRecords.length > cloudRecords.length;
+      nfCloudState.busy = false;
+      forceStats();
+      injectFinishModePicker();
+      if (shouldPushMerged) {
+        await nfCloudPushNow({ manual: false, forceOverwrite: true });
+      }
+      return { ok: true, mergedCount: mergedRecords.length, payoutFrom: merged.payoutFrom };
+    } catch (e) {
+      if (manual) toast('☁️ Ошибка восстановления: ' + e.message, true);
+      return { ok: false, message: e.message };
+    } finally {
+      nfCloudState.busy = false;
+      forceStats();
+    }
+  }
+
+  async function nfCloudCheckStartup() {
+    if (nfCloudState.checkedStartup) return;
+    const name = nfRemoteMyName();
+    if (!name) return;
+    nfCloudState.checkedStartup = true;
+    const s = loadStats();
+    if (s.records.length === 0) {
+      try {
+        const res = await nfRemotePost({ action: 'check_stats_cloud', name });
+        if (res && res.ok && res.exists) {
+          nfCloudState.pendingRestore = true;
+          forceStats();
+          toastAction(
+            '☁️ Для профиля «' + name + '» найдена копия в облаке. Восстановить по коду?',
+            'Восстановить',
+            () => nfCloudMergeRestore({ manual: true })
+          );
+        }
+      } catch (_) {}
+    } else if (nfCloudGetPinToken(name) && !s.cloudKnownRev) {
+      nfCloudSchedulePush(2500);
+    }
   }
 
   // Синтезатор звуковых эффектов (Web Audio API — работает без внешних файлов и блокировщиков)
@@ -5055,26 +6154,9 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     document.body.appendChild(overlay);
   }
 
-  function nfRemoteBannerCheckVersion(actualVer) {
-    if (!actualVer || String(actualVer).trim() === NF_SCRIPT_VERSION) {
-      document.getElementById('nf-update-bar')?.remove();
-      return;
-    }
-    if (document.getElementById('nf-update-bar')) return;
-    const bar = document.createElement('div');
-    bar.id = 'nf-update-bar';
-    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483640;background:linear-gradient(90deg,#6b5cff,#d9386a);'
-      + 'color:#fff;padding:8px 16px;display:flex;align-items:center;justify-content:center;gap:14px;font:700 13px Comfortaa,sans-serif;'
-      + 'box-shadow:0 4px 16px rgba(0,0,0,.22);';
-    const txt = document.createElement('span');
-    txt.textContent = '🚀 Доступна новая версия NeoCheck v' + actualVer + ' (у тебя v' + NF_SCRIPT_VERSION + ')!';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = '⚡ Обновить за 2 секунды';
-    btn.style.cssText = 'padding:5px 14px;border:0;border-radius:9px;background:#fff;color:#6b5cff;font:800 12px Comfortaa,sans-serif;cursor:pointer;';
-    btn.onclick = () => nfRemoteOpenUpdateTab();
-    bar.append(txt, btn);
-    document.body.appendChild(bar);
+  function nfRemoteBannerCheckVersion() {
+    // Авто-плашка сверху экрана отключена, чтобы не мешать методистам
+    document.getElementById('nf-update-bar')?.remove();
   }
 
   async function nfRemotePoll() {
@@ -5085,17 +6167,23 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
       if (res && res.actualVersion) {
         nfRemoteBannerCheckVersion(res.actualVersion);
       }
-      if (res && res.ok && res.msg && res.msg.id) {
-        const lastSeen = typeof GM_getValue === 'function'
-          ? GM_getValue(NF_REMOTE_SEEN_KEY, '')
-          : localStorage.getItem(NF_REMOTE_SEEN_KEY);
-        if (res.msg.id !== lastSeen) {
-          // Если методист сейчас не смотрит на вкладку (вкладка свёрнута), ждём пока откроет вкладку!
-          if (document.hidden) {
-            nfRemotePendingMsg = res.msg;
-          } else {
-            nfRemoteShowPopup(res.msg);
+      if (res && res.ok) {
+        if (res.msg && res.msg.id) {
+          const lastSeen = typeof GM_getValue === 'function'
+            ? GM_getValue(NF_REMOTE_SEEN_KEY, '')
+            : localStorage.getItem(NF_REMOTE_SEEN_KEY);
+          if (res.msg.id !== lastSeen) {
+            // Если методист сейчас не смотрит на вкладку (вкладка свёрнута), ждём пока откроет вкладку!
+            if (document.hidden) {
+              nfRemotePendingMsg = res.msg;
+            } else {
+              nfRemoteShowPopup(res.msg);
+            }
           }
+        } else {
+          // Если сообщение было отменено на сервере (или истекло) — сбрасываем ожидание и закрываем неподтверждённое окно
+          nfRemotePendingMsg = null;
+          document.getElementById('nf-remote-popup')?.remove();
         }
       }
     } catch (_) {}
@@ -5103,383 +6191,25 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && nfRemotePendingMsg) {
-      const msg = nfRemotePendingMsg;
-      nfRemotePendingMsg = null;
-      nfRemoteShowPopup(msg);
+      // Переспрашиваем сервер перед показом, чтобы не показать сообщение, если админ уже успел его отменить
+      nfRemotePoll();
     }
   });
 
-  function nfRemoteCompressImage(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = reject;
-      reader.onload = () => {
-        const img = new Image();
-        img.onerror = reject;
-        img.onload = () => {
-          const maxSide = 720;
-          const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-          const w = Math.round(img.width * scale);
-          const h = Math.round(img.height * scale);
-          const canvas = document.createElement('canvas');
-          canvas.width = w;
-          canvas.height = h;
-          const ctx = canvas.getContext('2d');
-          ctx.fillStyle = '#fff';
-          ctx.fillRect(0, 0, w, h);
-          ctx.drawImage(img, 0, 0, w, h);
-          resolve(canvas.toDataURL('image/jpeg', 0.78));
-        };
-        img.src = reader.result;
-      };
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function nfRemoteGetAdminSecret() {
-    try {
-      return (typeof GM_getValue === 'function' ? GM_getValue(NF_REMOTE_ADMIN_KEY, '') : localStorage.getItem(NF_REMOTE_ADMIN_KEY)) || '';
-    } catch (_) { return ''; }
-  }
-
-  function nfRemoteSetAdminSecret(val) {
-    try {
-      if (typeof GM_setValue === 'function') GM_setValue(NF_REMOTE_ADMIN_KEY, val);
-      else localStorage.setItem(NF_REMOTE_ADMIN_KEY, val);
-    } catch (_) {}
-  }
-
-  function nfRemoteOpenAdminModal() {
-    let secret = nfRemoteGetAdminSecret();
-    if (!secret) {
-      secret = prompt('Введи секретный пароль администратора пульта:') || '';
-      if (!secret.trim()) return;
-      nfRemoteSetAdminSecret(secret.trim());
-      nfRemoteAdminInject();
-    }
-
-    document.getElementById('nf-admin-console')?.remove();
-
-    const overlay = document.createElement('div');
-    overlay.id = 'nf-admin-console';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(18,14,30,.68);'
-      + 'display:flex;align-items:center;justify-content:center;padding:16px;font-family:Comfortaa,system-ui,sans-serif;';
-
-    const box = document.createElement('div');
-    box.style.cssText = 'width:min(540px,96vw);max-height:92vh;overflow:auto;background:#fff;color:#2b2338;border-radius:20px;padding:22px;'
-      + 'display:flex;flex-direction:column;gap:11px;box-shadow:0 20px 60px rgba(0,0,0,.35);';
-
-    const title = document.createElement('div');
-    title.style.cssText = 'font:800 18px Comfortaa,sans-serif;display:flex;justify-content:space-between;align-items:center;';
-    title.innerHTML = '<span>👑 Пульт управления экранами</span><span style="font-size:12px;color:#7a679e;">v' + NF_SCRIPT_VERSION + '</span>';
-
-    const targetInput = document.createElement('input');
-    targetInput.type = 'text';
-    targetInput.placeholder = 'Кому: например Моисеенко, Седых или * (всем)';
-    targetInput.value = nfRemoteMyName() || '';
-    targetInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;';
-
-    // Выбор звука и спецэффекта
-    const fxRow = document.createElement('div');
-    fxRow.style.cssText = 'display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;';
-
-    const soundSelect = document.createElement('select');
-    soundSelect.style.cssText = 'padding:8px 10px;border-radius:10px;border:1px solid #d4c8ec;font:600 12px sans-serif;background:#faf8ff;';
-    [
-      ['chime', '🔔 Звук: Колокольчик'],
-      ['fanfare', '🎺 Звук: Фанфары'],
-      ['alarm', '🚨 Звук: Сирена внимания'],
-      ['retro', '👾 Звук: 8-бит Mario'],
-      ['none', '🔕 Без звука']
-    ].forEach(([val, text]) => {
-      const opt = document.createElement('option');
-      opt.value = val;
-      opt.textContent = text;
-      soundSelect.appendChild(opt);
-    });
-
-    const testSoundBtn = document.createElement('button');
-    testSoundBtn.type = 'button';
-    testSoundBtn.textContent = '▶️';
-    testSoundBtn.title = 'Прослушать выбранный звук';
-    testSoundBtn.style.cssText = 'padding:7px 10px;border-radius:10px;border:1px solid #d4c8ec;background:#f3eeff;cursor:pointer;font-size:12px;';
-    testSoundBtn.onclick = () => nfRemotePlaySound(soundSelect.value);
-
-    const effectSelect = document.createElement('select');
-    effectSelect.style.cssText = 'padding:8px 10px;border-radius:10px;border:1px solid #d4c8ec;font:600 12px sans-serif;background:#faf8ff;';
-    [
-      ['confetti', '🎉 Эффект: Салют конфетти'],
-      ['shake', '💥 Эффект: Землетрясение'],
-      ['glow', '✨ Эффект: Неоновое сияние'],
-      ['none', '📄 Эффект: Обычное окно']
-    ].forEach(([val, text]) => {
-      const opt = document.createElement('option');
-      opt.value = val;
-      opt.textContent = text;
-      effectSelect.appendChild(opt);
-    });
-
-    fxRow.append(soundSelect, testSoundBtn, effectSelect);
-
-    const urlInput = document.createElement('input');
-    urlInput.type = 'text';
-    urlInput.placeholder = 'Ссылка на картинку/GIF или нажми Ctrl+V сюда';
-    urlInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;';
-
-    const fileInput = document.createElement('input');
-    fileInput.type = 'file';
-    fileInput.accept = 'image/*';
-    fileInput.style.cssText = 'font:12px sans-serif;';
-
-    const preview = document.createElement('img');
-    preview.style.cssText = 'max-height:140px;max-width:100%;object-fit:contain;border-radius:10px;display:none;align-self:center;';
-
-    let currentImageData = '';
-
-    function setPreview(src) {
-      currentImageData = src;
-      if (src) {
-        preview.src = src;
-        preview.style.display = 'block';
-      } else {
-        preview.style.display = 'none';
-      }
-    }
-
-    urlInput.oninput = () => setPreview(urlInput.value.trim());
-
-    fileInput.onchange = async () => {
-      const f = fileInput.files && fileInput.files[0];
-      if (!f) return;
-      const dataUrl = await nfRemoteCompressImage(f);
-      urlInput.value = '[Картинка из файла]';
-      setPreview(dataUrl);
-    };
-
-    box.addEventListener('paste', async e => {
-      const files = e.clipboardData && e.clipboardData.files;
-      if (files && files.length && /^image\//.test(files[0].type)) {
-        e.preventDefault();
-        const dataUrl = await nfRemoteCompressImage(files[0]);
-        urlInput.value = '[Картинка из буфера обмена]';
-        setPreview(dataUrl);
-      }
-    });
-
-    const captionInput = document.createElement('textarea');
-    captionInput.placeholder = 'Текст под картинкой (необязательно)';
-    captionInput.style.cssText = 'padding:10px 12px;border-radius:11px;border:1px solid #d4c8ec;font:600 13px sans-serif;min-height:58px;resize:vertical;';
-
-    const status = document.createElement('div');
-    status.style.cssText = 'font:700 12px sans-serif;color:#6b5cff;min-height:16px;';
-
-    // Кнопка принудительного обновления скрипта
-    const forceUpdateBtn = document.createElement('button');
-    forceUpdateBtn.type = 'button';
-    forceUpdateBtn.textContent = '🔔 Отправить требование обновить скрипт (до v' + NF_SCRIPT_VERSION + ')';
-    forceUpdateBtn.style.cssText = 'padding:9px 14px;border-radius:11px;border:1px dashed #d9386a;background:#fff0f5;color:#c2255c;cursor:pointer;font:800 12px sans-serif;';
-    forceUpdateBtn.onclick = async () => {
-      const target = targetInput.value.trim();
-      if (!target) { status.textContent = '❌ Укажи, кому отправить обновление (фамилию или *)'; return; }
-      forceUpdateBtn.disabled = true;
-      status.textContent = '⏳ Отправляем окно обновления…';
-      try {
-        const res = await nfRemotePost({
-          action: 'send_screen',
-          adminSecret: nfRemoteGetAdminSecret(),
-          secret: nfRemoteGetAdminSecret(),
-          target: target,
-          forceUpdate: true,
-          sound: 'alarm',
-          effect: 'glow',
-          caption: captionInput.value.trim() || ('Пожалуйста, обнови NeoCheck до актуальной версии v' + NF_SCRIPT_VERSION + '! Это займёт 2 секунды.'),
-          sender: nfRemoteMyName() || 'Кирилл'
-        });
-        if (!res.ok) {
-          status.textContent = '❌ Ошибка: ' + res.error;
-        } else {
-          status.textContent = '✅ Требование обновиться отправлено для «' + target + '»!';
-          loadReceipts();
-        }
-      } catch (err) {
-        status.textContent = '❌ ' + err.message;
-      } finally {
-        forceUpdateBtn.disabled = false;
-      }
-    };
-
-    const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:2px;';
-
-    const resetPassBtn = document.createElement('button');
-    resetPassBtn.type = 'button';
-    resetPassBtn.textContent = '🔑 Пароль';
-    resetPassBtn.style.cssText = 'margin-right:auto;padding:9px 12px;border-radius:11px;border:1px solid #ddd;background:#f8f8f8;cursor:pointer;font:700 12px sans-serif;';
-    resetPassBtn.onclick = () => {
-      const next = prompt('Новый пароль администратора (пусто — скрыть кнопку пульта):', nfRemoteGetAdminSecret());
-      if (next !== null) {
-        nfRemoteSetAdminSecret(next.trim());
-        if (!next.trim()) {
-          document.getElementById('nf-remote-admin-btn')?.remove();
-          overlay.remove();
-        }
-      }
-    };
-
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.textContent = 'Закрыть';
-    closeBtn.style.cssText = 'padding:9px 16px;border-radius:11px;border:1px solid #ccc;background:#fff;cursor:pointer;font:700 13px sans-serif;';
-    closeBtn.onclick = () => overlay.remove();
-
-    const sendBtn = document.createElement('button');
-    sendBtn.type = 'button';
-    sendBtn.textContent = '🚀 Отправить на экран';
-    sendBtn.style.cssText = 'padding:9px 18px;border-radius:11px;border:0;background:#6b5cff;color:#fff;cursor:pointer;font:800 13px sans-serif;';
-    sendBtn.onclick = async () => {
-      const target = targetInput.value.trim();
-      if (!target) { status.textContent = '❌ Укажи, кому отправить (фамилию или *)'; return; }
-      if (!currentImageData && !captionInput.value.trim()) {
-        status.textContent = '❌ Добавь картинку или текст';
-        return;
-      }
-      sendBtn.disabled = true;
-      status.textContent = '⏳ Отправляем…';
-      try {
-        const res = await nfRemotePost({
-          action: 'send_screen',
-          adminSecret: nfRemoteGetAdminSecret(),
-          secret: nfRemoteGetAdminSecret(),
-          target: target,
-          image: currentImageData,
-          caption: captionInput.value.trim(),
-          sound: soundSelect.value,
-          effect: effectSelect.value,
-          sender: nfRemoteMyName() || 'Кирилл'
-        });
-        if (!res.ok) {
-          status.textContent = '❌ Ошибка: ' + (res.error === 'bad_admin_secret' ? 'неверный пароль админа' : res.error);
-        } else {
-          status.textContent = '✅ Отправлено для «' + target + '»! Прилетит в течение 15 сек.';
-          setTimeout(nfRemotePoll, 800);
-          loadReceipts();
-        }
-      } catch (err) {
-        status.textContent = '❌ ' + err.message;
-      } finally {
-        sendBtn.disabled = false;
-      }
-    };
-
-    // Блок живого контроля прочтения прямо в пульте
-    const receiptsBox = document.createElement('div');
-    receiptsBox.style.cssText = 'margin-top:6px;padding:10px 12px;border-radius:12px;background:#f7f5fc;border:1px solid #e3dcf2;font:600 12px/1.45 sans-serif;max-height:175px;overflow:auto;';
-    const receiptsHead = document.createElement('div');
-    receiptsHead.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-weight:800;color:#4a3f68;';
-    receiptsHead.innerHTML = '<span>📬 Статус доставки и прочтения (последние)</span>';
-    const refreshReceiptsBtn = document.createElement('button');
-    refreshReceiptsBtn.type = 'button';
-    refreshReceiptsBtn.textContent = '🔄 Обновить';
-    refreshReceiptsBtn.style.cssText = 'border:0;background:#e9e2fa;color:#533f9e;border-radius:7px;padding:3px 8px;cursor:pointer;font:700 11px sans-serif;';
-    receiptsHead.appendChild(refreshReceiptsBtn);
-
-    const receiptsList = document.createElement('div');
-    receiptsList.style.cssText = 'display:flex;flex-direction:column;gap:6px;color:#3b334d;';
-    receiptsList.textContent = 'Загрузка статусов…';
-    receiptsBox.append(receiptsHead, receiptsList);
-
-    async function loadReceipts() {
-      try {
-        const res = await nfRemotePost({
-          action: 'get_receipts',
-          adminSecret: nfRemoteGetAdminSecret(),
-          secret: nfRemoteGetAdminSecret()
-        });
-        if (!res || !res.ok) {
-          receiptsList.textContent = 'Не удалось загрузить статусы: ' + (res?.error || 'ошибка');
-          return;
-        }
-        const items = Array.isArray(res.receipts) ? res.receipts : [];
-        if (!items.length) {
-          receiptsList.textContent = 'Пока нет отправленных сообщений.';
-          return;
-        }
-        receiptsList.innerHTML = '';
-        items.slice(0, 6).forEach(item => {
-          const row = document.createElement('div');
-          row.style.cssText = 'padding:6px 8px;border-radius:8px;background:#fff;border:1px solid #ece6f8;';
-          const readEntries = Object.entries(item.readBy || {});
-          const shownEntries = Object.entries(item.shownBy || {}).filter(([k]) => !(item.readBy && item.readBy[k]));
-
-          let statusHtml = '';
-          if (readEntries.length) {
-            statusHtml += readEntries.map(([who, info]) =>
-              '<span style="color:#1b7a43;font-weight:800;">✅ Прочитал(а) ' + who + '</span> (' + (info.reaction || 'ОК') + ' в ' + String(info.time || '').slice(11) + ')'
-            ).join('<br>');
-          }
-          if (shownEntries.length) {
-            if (statusHtml) statusHtml += '<br>';
-            statusHtml += shownEntries.map(([who, t]) =>
-              '<span style="color:#b86e00;font-weight:700;">👀 Открыто на экране у ' + who + '</span> (с ' + String(t || '').slice(11) + ', кнопку ещё не нажал)'
-            ).join('<br>');
-          }
-          if (!statusHtml) {
-            statusHtml = '<span style="color:#7c728f;">⏳ Ожидает появления методиста на сайте…</span>';
-          }
-
-          row.innerHTML = '<div style="font-weight:800;color:#2c2538;">Кому: ' + (item.target || '—')
-            + ' · <span style="font-weight:600;color:#7a679e;">' + (item.summary || '') + '</span></div>'
-            + '<div style="margin-top:3px;">' + statusHtml + '</div>';
-          receiptsList.appendChild(row);
-        });
-      } catch (_) {
-        receiptsList.textContent = 'Ошибка соединения при загрузке статусов.';
-      }
-    }
-
-    refreshReceiptsBtn.onclick = loadReceipts;
-    loadReceipts();
-
-    btnRow.append(resetPassBtn, closeBtn, sendBtn);
-    box.append(title, targetInput, fxRow, urlInput, fileInput, preview, captionInput, forceUpdateBtn, status, btnRow, receiptsBox);
-    overlay.appendChild(box);
-    overlay.addEventListener('mousedown', e => { if (e.target === overlay) overlay.remove(); });
-    document.body.appendChild(overlay);
-  }
-
-  function nfRemoteAdminInject() {
-    if (!nfRemoteGetAdminSecret()) return;
-    const dock = nfThemeDockInject();
-    if (!dock) return;
-    let b = document.getElementById('nf-remote-admin-btn');
-    if (b) {
-      if (b.parentElement !== dock) dock.appendChild(b);
-      return;
-    }
-    b = document.createElement('button');
-    b.id = 'nf-remote-admin-btn';
-    b.type = 'button';
-    b.className = 'nf-dock-btn';
-    b.textContent = '👑 Пульт';
-    b.title = 'Отправить картинку или сообщение на экран методисту (Alt+P)';
-    b.addEventListener('click', nfRemoteOpenAdminModal);
-    dock.appendChild(b);
-  }
-
-  document.addEventListener('keydown', e => {
-    if (e.altKey && (e.code === 'KeyP' || e.key === 'p' || e.key === 'з')) {
-      e.preventDefault();
-      nfRemoteOpenAdminModal();
-    }
-  });
   setInterval(nfRemotePoll, NF_REMOTE_POLL_MS);
   setTimeout(nfRemotePoll, 3500);
+  setTimeout(nfCloudCheckStartup, 4200);
+  setInterval(() => {
+    const s = loadStats();
+    if (s.records.length > 0) nfCloudPushNow({ manual: false });
+  }, 15 * 60 * 1000);
 
   function inject() {
     document.querySelectorAll('[data-task-id]').forEach(card => { addCopyButton(card); addViewRow(card); });
     injectPanels();
     syncAttach();
     refreshView();
+    scanRotate();
     trackAnswers();
     injectFinishModePicker();
     ensureStatsWidget();
@@ -5491,7 +6221,7 @@ const keyBox = [...region.querySelectorAll(DETAIL)].find(d => /Элементы 
     nfQuickReplyInject();
     nfFocusInject();
     nfChatLocksInject();
-    nfRemoteAdminInject();
+    if (!nfCloudState.checkedStartup) nfCloudCheckStartup();
   }
 
   let timer;
