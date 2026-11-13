@@ -1613,7 +1613,7 @@
     const nameIn=document.createElement('input');
     nameIn.type='text';
     nameIn.maxLength=60;
-    nameIn.placeholder='Например: Саид Рагимов';
+    nameIn.placeholder='Например: Ученик NeoFamily';
     nameIn.value=detectTreeAuthor();
     nameIn.style.cssText='padding:9px 11px;border-radius:11px;border:1px solid #c1daf0;background:#f7fbff;color:#1b3650;font:600 13px sans-serif;';
     nameLbl.appendChild(nameIn);
