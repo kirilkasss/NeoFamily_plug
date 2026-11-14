@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      3
+// @version      3.1
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Копирование задания и ключа, сканер/лупа фото, режим «ключ рядом». 2) Шаблоны ответов и вложения. 3) Подсчёт заданий и выплат с гибким периодом, точным переключением ИИ/обычная и облачным восстановлением. 4) Личный график смен и быстрый регламент.
@@ -16,6 +16,7 @@
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @connect      raw.githubusercontent.com
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -28,7 +29,7 @@
 
   // Эта строка добавляется в начало копируемого текста. Можно поменять или оставить пустой ''.
   const PREFIX = 'Проверь по скиллу ege-bio-check.';
-  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.83';
+  const NF_SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '1.84';
   const NF_SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js';
 
   const DETAIL = '[class*="detail-text_detailText"]';
@@ -1992,8 +1993,11 @@
       sources.push({ el: cont, key: cont.id, type: 'homework', src: 'dialogue' });
     });
 
-    // Комментарии под заданиями — только если включены в настройках.
-    if (settings.taskComments) {
+    // Комментарии под заданиями:
+    // 1) Обязательно в уже проверенной домашке (pageMode() === 'checked'), когда методист отвечает ученику на вопросы по заданиям.
+    // 2) Либо если явно включено в настройках settings.taskComments.
+    const isCheckedPage = pageMode() === 'checked';
+    if (isCheckedPage || settings.taskComments) {
       document.querySelectorAll('[id$="-comments"]').forEach(cont => {
         if (!cont.id) return;
         sources.push({ el: cont, key: cont.id, type: 'task', src: 'task' });
@@ -2039,7 +2043,7 @@
           return;
         }
         if (Date.now() - m.t < 2500) return;
-        db[key] = { n: T, ts: Date.now() };
+        db[key] = { n: T, ts: Date.now(), credited: (T > 0 ? 1 : 0) };
         changed = true;
         return;
       }
@@ -2067,7 +2071,23 @@
       }
       delete msgDropMem[key];
 
-      added.push({ key, delta: T - base.n, type: source.type, src: source.src });
+      // Вычисляем дельту новых ответов методиста
+      let delta = T - base.n;
+
+      // Регламент для проверенной домашки и комментариев к заданиям:
+      // Засчитывается строго +1 сообщение (+2 ₽) за ответ, а все последующие сообщения методиста в этот же тред НЕ считаются!
+      if (source.type === 'task' || isCheckedPage) {
+        if ((base.credited || 0) >= 1) {
+          base.n = T;
+          base.ts = Date.now();
+          changed = true;
+          return;
+        }
+        delta = Math.min(1, delta);
+        base.credited = (base.credited || 0) + delta;
+      }
+
+      added.push({ key, delta, type: source.type, src: source.src });
       base.n = T;
       base.ts = Date.now();
       changed = true;
@@ -5743,20 +5763,24 @@
 
   function nfRemoteMyName() {
     // Строго подтверждённое ФИО авторизованного пользователя (никогда не подменяется чужим из «Мои смены»)
-    return shiftDetectMethodistName() || '';
+    return shiftDetectMethodistName() || shiftSidebarFirstName() || '';
   }
 
   function nfRemotePost(payload) {
+    const bodyStr = JSON.stringify({ key: SHIFT_GOOGLE_KEY, ...payload });
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') {
-        reject(new Error('GM_xmlhttpRequest недоступен'));
+        fetch(SHIFT_GOOGLE_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: bodyStr })
+          .then(r => r.json())
+          .then(resolve)
+          .catch(() => reject(new Error('Ошибка сети')));
         return;
       }
       GM_xmlhttpRequest({
         method: 'POST',
         url: SHIFT_GOOGLE_URL,
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        data: JSON.stringify({ key: SHIFT_GOOGLE_KEY, ...payload }),
+        data: bodyStr,
         timeout: 20000,
         onload: r => {
           try {
@@ -5765,7 +5789,12 @@
             reject(new Error('Ошибка ответа сервера'));
           }
         },
-        onerror: () => reject(new Error('Ошибка сети')),
+        onerror: () => {
+          fetch(SHIFT_GOOGLE_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: bodyStr })
+            .then(r => r.json())
+            .then(resolve)
+            .catch(() => reject(new Error('Ошибка сети')));
+        },
         ontimeout: () => reject(new Error('Таймаут'))
       });
     });
