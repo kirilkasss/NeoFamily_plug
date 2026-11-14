@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NeoCheck V3
 // @namespace    neofamily-copy-for-check
-// @version      3.1
+// @version      3.2
 // @updateURL    https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @downloadURL  https://raw.githubusercontent.com/kirilkasss/NeoFamily_plug/main/neocheck.user.js
 // @description  1) Копирование задания и ключа, сканер/лупа фото, режим «ключ рядом». 2) Шаблоны ответов и вложения. 3) Подсчёт заданий и выплат с гибким периодом, точным переключением ИИ/обычная и облачным восстановлением. 4) Личный график смен и быстрый регламент.
@@ -5285,6 +5285,12 @@
         html[data-nf-theme="newyear"] #nf-theme-dock-menu button {color:#1b3650;}
         html[data-nf-theme="newyear"] #nf-theme-dock-menu button:hover,
         html[data-nf-theme="newyear"] #nf-theme-dock-menu button[data-active="true"]{background:#dff0fd;}
+        html[data-nf-theme="paper"] #nf-quick-dock .nf-dock-btn {background:#fbf6e8;color:#3d2a16;border-color:#d4bf98;box-shadow:0 5px 18px rgba(105,78,39,.14);}
+        html[data-nf-theme="paper"] #nf-quick-dock .nf-dock-btn:hover {background:#f1e6cd;border-color:#b8925c;}
+        html[data-nf-theme="paper"] #nf-theme-dock-menu {background:#fbf6e8;border-color:#d4bf98;box-shadow:0 12px 30px rgba(105,78,39,.18);}
+        html[data-nf-theme="paper"] #nf-theme-dock-menu button {color:#2b2116;}
+        html[data-nf-theme="paper"] #nf-theme-dock-menu button:hover,
+        html[data-nf-theme="paper"] #nf-theme-dock-menu button[data-active="true"]{background:#eadcc0;}
         html.nf-check-focus #tm-pink-coquette-decor,html.nf-check-focus .tm-pink-note,
         html.nf-check-focus #nf-ny-garland,html.nf-check-focus #nf-ny-snow {display:none !important;}
         @media(max-width:700px){#nf-quick-dock{left:10px;bottom:10px;gap:6px;}#nf-quick-dock .nf-dock-btn{height:36px;padding:0 10px;font-size:11px;}}
@@ -5308,7 +5314,7 @@
     const themeBtn=document.createElement('button');themeBtn.id='nf-theme-dock-toggle';themeBtn.className='nf-dock-btn';themeBtn.type='button';themeBtn.textContent='🎨 Тема';
     themeBtn.setAttribute('aria-expanded','false');
     const menu=document.createElement('div');menu.id='nf-theme-dock-menu';menu.hidden=true;
-    const options=[['pink','🎀 Pink Pick Me'],['halloween','🎃 Halloween'],['newyear','🎄 Новый год']];
+    const options=[['pink','🎀 Pink Pick Me'],['halloween','🎃 Halloween'],['newyear','🎄 Новый год'],['paper','📖 Бумага']];
     const current=()=>document.documentElement.dataset.nfTheme || (()=>{try{return localStorage.getItem(NF_THEME_STORAGE_KEY)||'pink';}catch{return 'pink';}})();
     options.forEach(([value,label])=>{
       const b=document.createElement('button');b.type='button';b.textContent=label;b.dataset.value=value;
