@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NeoFamily Themes
 // @namespace    https://neofamily.ru/
-// @version      2.3.0
-// @description  Три самостоятельные темы: Pink Pick Me, тёмная Halloween и зимняя Новый год (гирлянда, снежинки, интерактивная командная ёлочка с пожеланиями методистов). Только оформление и праздничный виджет.
+// @version      2.4.1
+// @description  Четыре самостоятельные темы: Pink Pick Me, тёмная Halloween, зимняя Новый год (гирлянда, снежинки, ёлочка) и спокойная жёлтовато-кремовая Бумага для чтения (Minimal Focus). Только оформление.
 // @match        https://neofamily.ru/*
 // @match        https://www.neofamily.ru/*
 // @run-at       document-idle
@@ -10,6 +10,7 @@
 // @grant        GM_xmlhttpRequest
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @connect      *
 // ==/UserScript==
 
 (function () {
@@ -680,14 +681,15 @@
     });
   }
 
-  // ===== NeoFamily Themes 2.2: Pink Pick Me + Halloween + Новый год =====
+  // ===== NeoFamily Themes 2.4: Pink Pick Me + Halloween + Новый год + Бумага =====
   const THEME_KEY='nf_themes_choice_v2';
   const DECOR_KEY='nf_themes_decor_v2';
   const MOTION_KEY='nf_themes_motion_v2';
   const themes={
     pink:{name:'Pink Pick Me',icon:'🎀'},
     halloween:{name:'Halloween',icon:'🎃'},
-    newyear:{name:'Новый год',icon:'🎄'}
+    newyear:{name:'Новый год',icon:'🎄'},
+    paper:{name:'Бумага',icon:'📖'}
   };
   const load=(k,d)=>{try{return localStorage.getItem(k)||d;}catch{return d;}};
   const save=(k,v)=>{try{localStorage.setItem(k,v);}catch{}};
@@ -696,7 +698,8 @@
   let motionOn=load(MOTION_KEY,'yes')==='yes';
   const variants={
     halloween:{bg:'#17121e',card:'#282031',card2:'#332839',text:'#f7eef5',muted:'#cbbdd0',accent:'#ff994f',line:'#705069',glow:'rgba(253,130,63,.11)',grad:'#17121e,#271b31',light:false},
-    newyear:{bg:'#f1f7fd',card:'#ffffff',card2:'#e8f2fb',text:'#1b3650',muted:'#567491',accent:'#1f7a5c',line:'#c2daee',glow:'rgba(45,108,162,.10)',grad:'#edf5ff 0%,#f7fbff 52%,#eef6fc 100%',light:true}
+    newyear:{bg:'#f1f7fd',card:'#ffffff',card2:'#e8f2fb',text:'#1b3650',muted:'#567491',accent:'#1f7a5c',accent2:'#145c44',line:'#c2daee',glow:'rgba(45,108,162,.10)',grad:'#edf5ff 0%,#f7fbff 52%,#eef6fc 100%',light:true},
+    paper:{bg:'#f3e9d2',card:'#fbf6e8',card2:'#efe4cb',text:'#2b2116',muted:'#6d5c47',accent:'#9c5c25',accent2:'#7d4618',line:'#d9c8a8',glow:'rgba(110,82,42,.09)',grad:'#f7f0dc 0%,#f2e7ce 55%,#ede0c2 100%',light:true}
   };
   const drawings={
     halloween:[
@@ -763,7 +766,7 @@
     html[data-nf-theme="${id}"] input,html[data-nf-theme="${id}"] textarea,html[data-nf-theme="${id}"] select,html[data-nf-theme="${id}"] [role="combobox"],html[data-nf-theme="${id}"] [contenteditable="true"] {background-color:${c.card2} !important;color:${c.text} !important;border-color:${c.line} !important;caret-color:${c.accent} !important;}
     html[data-nf-theme="${id}"] input::placeholder,html[data-nf-theme="${id}"] textarea::placeholder {color:${c.muted} !important;opacity:.9 !important;}
     html[data-nf-theme="${id}"] [data-radix-popper-content-wrapper] > *,html[data-nf-theme="${id}"] [role="dialog"],html[data-nf-theme="${id}"] [role="menu"],html[data-nf-theme="${id}"] [role="listbox"] {background:${c.card} !important;color:${c.text} !important;border-color:${c.line} !important;}
-    html[data-nf-theme="${id}"] button[class*="bg-subject-biology"],html[data-nf-theme="${id}"] button[class*="bg-main"],html[data-nf-theme="${id}"] button[class*="bg-light-pink"],html[data-nf-theme="${id}"] a[class*="bg-subject-biology"],html[data-nf-theme="${id}"] .tm-pink-start-check {background:linear-gradient(125deg,${c.accent},${c.light?'#145c44':c.line}) !important;color:${c.light?'#fff':'#181626'} !important;border-color:${c.line} !important;}
+    html[data-nf-theme="${id}"] button[class*="bg-subject-biology"],html[data-nf-theme="${id}"] button[class*="bg-main"],html[data-nf-theme="${id}"] button[class*="bg-light-pink"],html[data-nf-theme="${id}"] a[class*="bg-subject-biology"],html[data-nf-theme="${id}"] .tm-pink-start-check {background:linear-gradient(125deg,${c.accent},${c.light?(c.accent2||'#145c44'):c.line}) !important;color:${c.light?'#fff':'#181626'} !important;border-color:${c.line} !important;}
     html[data-nf-theme="${id}"] [role="tablist"] button,html[data-nf-theme="${id}"] .swiper-slide button,html[data-nf-theme="${id}"] nav a:hover,html[data-nf-theme="${id}"] nav button:hover {background:${c.card2} !important;color:${c.text} !important;border-color:${c.line} !important;}
     html[data-nf-theme="${id}"] [class*="bg-light-pink"],html[data-nf-theme="${id}"] [class*="bg-background-secondary"] {background:${c.card2} !important;color:${c.text} !important;border-color:${c.line} !important;}
     html[data-nf-theme="${id}"] aside #nf-reg-sidebar-link {color:${c.text} !important;}
@@ -1013,9 +1016,100 @@
     }
   `;
 
+  // Тёплая «Бумага для чтения» (Minimal Focus): жёлтовато-кремовый фон в духе E-Ink, мягкая сепия и ноль лишнего декора
+  const paperCss = `
+    html[data-nf-theme="paper"] body {
+      background:linear-gradient(155deg,#f8f1dd 0%,#f2e7ce 54%,#ece0c2 100%) fixed !important;
+      color:#2b2116 !important;
+    }
+    html[data-nf-theme="paper"] ::selection {background:#f2d485 !important;color:#231a10 !important;}
+    html[data-nf-theme="paper"] header {
+      background:rgba(249,243,226,.95) !important;
+      border-bottom:1px solid #d9c8a8 !important;
+      box-shadow:0 3px 12px rgba(96,70,35,.07) !important;
+      backdrop-filter:none !important;
+    }
+    html[data-nf-theme="paper"] nav a:hover,
+    html[data-nf-theme="paper"] nav button:hover,
+    html[data-nf-theme="paper"] nav [role="button"]:hover {
+      background:#eadcc0 !important;color:#5c3413 !important;
+    }
+    html[data-nf-theme="paper"] h1,
+    html[data-nf-theme="paper"] h2,
+    html[data-nf-theme="paper"] h3,
+    html[data-nf-theme="paper"] h4,
+    html[data-nf-theme="paper"] h5,
+    html[data-nf-theme="paper"] h6 {color:#3d2a16 !important;}
+    html[data-nf-theme="paper"] main [class*="text-muted"],
+    html[data-nf-theme="paper"] main [class*="text-secondary"],
+    html[data-nf-theme="paper"] .tm-pink-table-head {color:#6d5c47 !important;}
+    html[data-nf-theme="paper"] aside,
+    html[data-nf-theme="paper"] main .rounded-2xl,
+    html[data-nf-theme="paper"] .grid.grid-cols-\\[minmax\\(0\\,1fr\\)\\]>div:not(.swiper-wrapper),
+    html[data-nf-theme="paper"] .grid.grid-cols-\\[minmax\\(0\\,1fr\\)\\] .rounded-2xl {
+      background:#fbf6e8 !important;color:#2b2116 !important;
+      border-color:#d9c8a8 !important;box-shadow:0 3px 14px rgba(105,78,39,.07) !important;
+    }
+    html[data-nf-theme="paper"] button:hover,
+    html[data-nf-theme="paper"] [role="button"]:hover {border-color:#bfa376 !important;}
+    html[data-nf-theme="paper"] [role="tablist"] button[aria-selected="true"],
+    html[data-nf-theme="paper"] .swiper-slide button[data-state="active"] {
+      background:#e7d7b5 !important;color:#4a2b10 !important;border-color:#b8925c !important;
+    }
+    html[data-nf-theme="paper"] [class*="bg-light-pink"] {
+      background:#f0e4c8 !important;color:#4a2b10 !important;border-color:#d4bf98 !important;
+    }
+    html[data-nf-theme="paper"] input,
+    html[data-nf-theme="paper"] textarea,
+    html[data-nf-theme="paper"] select,
+    html[data-nf-theme="paper"] [role="combobox"],
+    html[data-nf-theme="paper"] [contenteditable="true"] {
+      background-color:#f6eed7 !important;color:#2b2116 !important;
+      border-color:#d4c19e !important;caret-color:#8a4f1d !important;
+    }
+    html[data-nf-theme="paper"] input:focus,
+    html[data-nf-theme="paper"] textarea:focus,
+    html[data-nf-theme="paper"] select:focus {
+      box-shadow:0 0 0 2px rgba(156,92,37,.20) !important;border-color:#9c5c25 !important;
+    }
+    html[data-nf-theme="paper"] [id^="attempt-card-"] img:not([alt*="аватар"]),
+    html[data-nf-theme="paper"] [data-task-id] img:not([alt*="аватар"]) {
+      border-color:#d9c8a8 !important;filter:none !important;
+    }
+    html[data-nf-theme="paper"] :is([id^="attempt-card-"][id$="-comments"],[id^="attempt-"][id$="-dialogue"])
+      :is([class*="rounded-xl"],[class*="rounded-2xl"],[class*="bg-white"],[class*="bg-gray"],[class*="bg-slate"],.ProseMirror){
+      background-color:#f6eed7 !important;color:#2b2116 !important;border-color:#d4c19e !important;
+    }
+    html[data-nf-theme="paper"] aside #nf-reg-sidebar-link .nf-pink-reg-icon {color:#9c5c25 !important;}
+    html[data-nf-theme="paper"] aside #nf-reg-sidebar-link .nf-pink-reg-label {color:#4a2b10 !important;}
+    html[data-nf-theme="paper"] aside #nf-reg-sidebar-link:hover {background:#eadcc0 !important;}
+    html[data-nf-theme="paper"] main .tm-pink-start-check {
+      background:linear-gradient(125deg,#9c5c25,#7d4618) !important;color:#fff !important;
+      border:1px solid #6b3b12 !important;box-shadow:0 5px 14px rgba(125,70,24,.22) !important;
+    }
+    html[data-nf-theme="paper"] main .tm-pink-start-check:hover {background:linear-gradient(125deg,#874d1d,#6b3b12) !important;}
+    html[data-nf-theme="paper"] #nf-shift-panel {background:#fbf6e8 !important;border:1px solid #d9c8a8 !important;color:#2b2116 !important;}
+    html[data-nf-theme="paper"] .nf-stats-widget,
+    html[data-nf-theme="paper"] .nf-tpl-panel,
+    html[data-nf-theme="paper"] .nf-attach-preview {background:#fbf6e8 !important;border-color:#d9c8a8 !important;color:#2b2116 !important;}
+    html[data-nf-theme="paper"] .nf-ai-clean-bar,
+    html[data-nf-theme="paper"] .nf-dlg-summary-bar,
+    html[data-nf-theme="paper"] .nf-quick-replies button {background:#f2e7ce !important;border-color:#d4bf98 !important;color:#4a2b10 !important;}
+    html[data-nf-theme="paper"] #nf-theme-trigger,
+    html[data-nf-theme="paper"] #nf-theme-panel {background:#fbf6e8 !important;border-color:#d4bf98 !important;color:#2b2116 !important;}
+    html[data-nf-theme="paper"] .nf-theme-option {background:#f6eed7 !important;border-color:#d4bf98 !important;color:#2b2116 !important;}
+    html[data-nf-theme="paper"] .nf-theme-option[aria-pressed="true"] {outline:2px solid #9c5c25 !important;}
+    html[data-nf-theme="paper"] #nf-theme-art,
+    html[data-nf-theme="paper"] #nf-ny-garland,
+    html[data-nf-theme="paper"] #nf-ny-snow,
+    html[data-nf-theme="paper"] #nf-ny-tree-box,
+    html[data-nf-theme="paper"] #nf-hw-edge-art {display:none !important;}
+  `;
+
   const themeUiCss=`
     ${themeCss}
     ${newYearCss}
+    ${paperCss}
     #nf-theme-switcher {position:fixed;right:16px;top:48%;z-index:10020;font:600 13px/1.4 system-ui,sans-serif;}
     #nf-theme-trigger {width:44px;height:44px;border-radius:14px;border:1px solid var(--pink-border) !important;background:var(--pink-surface-strong) !important;color:var(--pink-text) !important;box-shadow:0 5px 20px rgba(0,0,0,.15) !important;cursor:pointer;font-size:22px;}
     #nf-theme-panel {position:absolute;right:52px;top:-84px;width:260px;max-height:min(520px,85vh);overflow:auto;padding:14px;border:1px solid var(--pink-border);background:var(--pink-surface-strong);color:var(--pink-text);border-radius:18px;box-shadow:0 12px 35px rgba(0,0,0,.22);}
@@ -1489,7 +1583,12 @@
           headers:{'Content-Type':'text/plain;charset=utf-8'},
           data:bodyStr,timeout:15000,
           onload:r=>{try{resolve(JSON.parse(r.responseText||'{}'));}catch{reject(new Error('Ошибка ответа'));}},
-          onerror:()=>reject(new Error('Ошибка сети')),
+          onerror:()=>{
+            fetch(TREE_API_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:bodyStr})
+              .then(r=>r.json())
+              .then(resolve)
+              .catch(()=>reject(new Error('Ошибка сети')));
+          },
           ontimeout:()=>reject(new Error('Таймаут'))
         });
       });
@@ -1741,6 +1840,7 @@
           status.textContent='❌ '+(res?.error||'Не удалось сохранить');
         }
       }catch(e){
+        setTimeout(()=>{ refreshTreeOrnaments({force:true}); }, 1500);
         status.style.color='#b83f53';
         status.textContent='❌ '+e.message;
       }finally{saveBtn.disabled=false;}
@@ -1964,9 +2064,10 @@
 
   function paintIllustrations(){
     const old=document.getElementById('nf-theme-art');if(old)old.remove();
-    if(activeTheme==='pink'||!document.body)return;
+    const list=drawings[activeTheme];
+    if(!list||!list.length||!document.body)return;
     const layer=document.createElement('div');layer.id='nf-theme-art';layer.setAttribute('aria-hidden','true');
-    (drawings[activeTheme]||[]).forEach(draw=>{
+    list.forEach(draw=>{
       const wrap=document.createElement('div');wrap.className='nf-theme-illustration';
       wrap.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 180" width="100%" height="100%" aria-hidden="true">${draw}</svg>`;
       layer.appendChild(wrap);
